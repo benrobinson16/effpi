@@ -64,7 +64,31 @@ case class Call[V[X]  <: ProcVar[X], A](procvar: V[A], arg: A) extends Process
 
 case class >>:[P1 <: Process, P2 <: Process](p1: () => P1, p2: () => P2) extends Process
 
+sealed abstract class MatchList {
+  def <>[M >: this.type <: Match[_, _], Rest <: MatchList](rest: Rest) = <>:[M, Rest]()
+}
+case class Match[T, P <: T => Process](cont: P) extends MatchList
+case class <>:[M <: Match[_, _], Rest <: MatchList]() extends MatchList
+
+type ExtractUnion[L <: MatchList] = L match {
+  case Match[t, _] => t
+  case Match[t, _] <>: rest => t | ExtractUnion[rest]
+}
+
+sealed trait ValidMatches[Matches <: MatchList, A]
+object ValidMatches {
+  given valid[M <: MatchList, A](using
+    ev1: ExtractUnion[M] <:< A,
+    ev2: A <:< ExtractUnion[M]
+  ): ValidMatches[M, A] with {}
+}
+
+case class Branch[C <: InChannel[A], A, Matches <: MatchList](channel: C, matches: Matches, timeout: Duration)(
+  using ValidMatches[Matches, A]
+) extends Process
+
 package object dsl {
+
   /** Recursion: `P` loops on `V`, that represent a bound recursion variable. */
   type Rec[V[X] <: RecVar[X], P <: Process] = Def[V, Unit, P, P]
 
@@ -164,6 +188,12 @@ package object dsl {
 
   /** Use channel `c` to receive a value, then pass it to the `cont`inuation. */
   def receive[C <: InChannel[A], A, P <: A => Process](c: C)(cont: P)(implicit timeout: Duration) = In[C,A,P](c, cont, timeout)
+
+  def branchCase[T, P](cont: P)(implicit ev: P <:< (T => Process)) = Match[T, P](cont)
+
+  def branch[C <: InChannel[A], A, Matches <: MatchList](c: C)(matches: Matches)(
+    using ValidMatches[Matches, A]
+  )(implicit timeout: Duration) = Branch[C, A, Matches](c, matches, timeout)
 
   /** Fork `p` as a separate process.
   *
