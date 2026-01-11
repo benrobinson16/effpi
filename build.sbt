@@ -1,4 +1,4 @@
-val dottyVersion = "3.0.0-M1"
+val dottyVersion = "3.0.0"
 val effpiVersion = "0.0.3"
 
 val useEffpiPlugin = settingKey[Boolean]("Use the effpi compiler plugin in sub-projects.")
@@ -28,7 +28,7 @@ lazy val plugin = project
     // TODO: exclude unnecessary dependencies from assembly jar
     libraryDependencies ++= Seq(
       "org.scala-lang" %% "scala3-compiler" % scalaVersion.value % "provided",
-      ("org.scala-lang.modules" %% "scala-parser-combinators" % "1.1.2").withDottyCompat(scalaVersion.value),
+      "org.scala-lang.modules" %% "scala-parser-combinators" % "2.0.0",
       "org.antlr" % "ST4" % "4.3.1"
     ),
   )
@@ -42,12 +42,12 @@ lazy val benchmarks = project
     scalaVersion := dottyVersion,
 
     libraryDependencies ++= Seq(
-        ("com.typesafe.akka" %% "akka-actor-typed" % "2.6.9").withDottyCompat(scalaVersion.value).
+        ("com.typesafe.akka" %% "akka-actor-typed" % "2.6.9").
         exclude("org.scala-lang.modules", "scala-java8-compat_2.13")
     ),
 
     libraryDependencies ++= Seq(
-      ("org.scalikejdbc" %% "scalikejdbc" % "3.5.0").withDottyCompat(scalaVersion.value),
+      "org.scalikejdbc" %% "scalikejdbc" % "3.5.0",
       "org.xerial"      % "sqlite-jdbc"      % "3.32.3.2",
       "ch.qos.logback"  % "logback-classic"  % "1.2.3"
     ),

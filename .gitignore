@@ -9,3 +9,5 @@ benchmarkresults/
 benchmarks.db
 
 .vscode
+.metals/
+.java-version
