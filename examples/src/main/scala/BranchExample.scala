@@ -7,26 +7,44 @@ import effpi.process.dsl._
 import scala.concurrent.duration.Duration
 
 package object types {
-    type IntCase[OInt <: OChan[Int]] = Int => Out[OInt, Int] >>: PNil
-    type StrCase[OStr <: OChan[String]] = String => Out[OStr, String] >>: PNil
-
   type Splitter[C <: IChan[Int | String],
-                OInt <: OChan[Int],
-                OStr <: OChan[String]] =
-    Branch[C, Int | String, Match[Int, IntCase[OInt]] <>:
-                            Match[String, StrCase[OStr]]]
+                 OInt <: OChan[Int],
+                 OStr <: OChan[String]] =
+    Branch1[Int | String, C, (
+      (v: Int) => Out[OInt, v.type] >>: PNil,
+      (v: String) => Out[OStr, v.type] >>: PNil
+    )]
+
+  type Crossroads[C1 <: IChan[Int | String],
+                  C2 <: IChan[Int | String],
+                  OInt <: OChan[Int],
+                  OStr <: OChan[String]] =
+    Rec[RecX,
+      Branch[Int | String, (C1, C2), (
+        (v: Int) => Out[OInt, v.type] >>: Loop[RecX],
+        (v: String) => Out[OStr, v.type] >>: Loop[RecX]
+      )]
+    ]
 }
 
 package object implementation {
   import types._
   implicit val timeout: Duration = Duration(30, "seconds")
 
-  def splitter[C <: IChan[Int | String], OInt <: OChan[Int], OStr <: OChan[String]](
-    in: C, outInt: OInt, outStr: OStr
-  ): Splitter[C, OInt, OStr] = {
-    branch(in)(
-      branchCase((v: Int) => send(outInt, v) >> nil) <> branchCase((v: String) => send(outStr, v) >> nil)
-    )
+  def splitter(in: IChan[Int | String], outInt: OChan[Int], outStr: OChan[String]): Splitter[in.type, outInt.type, outStr.type] = {
+    branch1(in, (
+      (v: Int) => send(outInt, v) >> nil,
+      (v: String) => send(outStr, v) >> nil
+    ))
+  }
+
+  def crossroads(in1: IChan[Int | String], in2: IChan[Int | String], outInt: OChan[Int], outStr: OChan[String]): Crossroads[in1.type, in2.type, outInt.type, outStr.type] = {
+    rec(RecX) {
+      branch((in1, in2), (
+        (v: Int) => send(outInt, v) >> loop(RecX),
+        (v: String) => send(outStr, v) >> loop(RecX)
+      ))
+    }
   }
 }
 

@@ -64,28 +64,47 @@ case class Call[V[X]  <: ProcVar[X], A](procvar: V[A], arg: A) extends Process
 
 case class >>:[P1 <: Process, P2 <: Process](p1: () => P1, p2: () => P2) extends Process
 
-sealed abstract class MatchList {
-  def <>[M >: this.type <: Match[_, _], Rest <: MatchList](rest: Rest) = <>:[M, Rest]()
-}
-case class Match[T, P <: T => Process](cont: P) extends MatchList
-case class <>:[M <: Match[_, _], Rest <: MatchList]() extends MatchList
+// Extract the argument of a Function1 type
+type ArgumentOf[F] = F match
+  case Function1[i, ?] => i
 
-type ExtractUnion[L <: MatchList] = L match {
-  case Match[t, _] => t
-  case Match[t, _] <>: rest => t | ExtractUnion[rest]
+// Enforce constraints on the channels and match cases of a Branch
+sealed trait ValidBranch[A, Chans <: Tuple, Matches <: Tuple]
+object ValidBranch {
+  given valid[A, Chans <: Tuple, Matches <: Tuple](using
+
+    // The channels are all input channels accepting some subtype of A
+    ev1: Tuple.Union[Chans] <:< InChannel[A],
+
+    // The match cases are all functions to some process
+    ev2: Tuple.Union[Matches] <:< Function1[?, Process],
+
+    // The match cases cover exactly all possible inputs of A
+    ev3: Tuple.Union[Tuple.Map[Matches, ArgumentOf]] =:= A,
+
+    // NB: =:= is slightly different to <:< and >:> together.
+    // If we have problems with ordering/etc of unions, we might
+    // need to switch to using <:< and >:> instead.
+
+    // // Each case only accepts inputs belonging to A
+    // ev3: Tuple.Union[Tuple.Map[Matches, ArgumentOf]] <:< A,
+
+    // // The match cases cover all possible inputs of A
+    // ev4: A <:< Tuple.Union[Tuple.Map[Matches, ArgumentOf]]
+  ): ValidBranch[A, Chans, Matches] with {}
 }
 
-sealed trait ValidMatches[Matches <: MatchList, A]
-object ValidMatches {
-  given valid[M <: MatchList, A](using
-    ev1: ExtractUnion[M] <:< A,
-    ev2: A <:< ExtractUnion[M]
-  ): ValidMatches[M, A] with {}
-}
+case class Branch[A, Chans <: Tuple, Matches <: Tuple]
+  (channels: Chans, matches: Matches, timeout: Duration)
+  (using ValidBranch[A, Chans, Matches])
+  extends Process
 
-case class Branch[C <: InChannel[A], A, Matches <: MatchList](channel: C, matches: Matches, timeout: Duration)(
-  using ValidMatches[Matches, A]
-) extends Process
+// Helper for Branch - we can't write Branch[A, (InChannel[A]), ...] and
+// it is awkward to define Branch[A, InChannel[A] *: EmptyTuple, ...]
+// or Branch[A, Tuple1[InChannel[A]], ...], so make it easier by not expecting
+// a tuple for a single channel.
+type Branch1[A, Chan <: InChannel[A], Matches <: Tuple] =
+  Branch[A, Tuple1[Chan], Matches]
 
 package object dsl {
 
@@ -189,12 +208,17 @@ package object dsl {
   /** Use channel `c` to receive a value, then pass it to the `cont`inuation. */
   def receive[C <: InChannel[A], A, P <: A => Process](c: C)(cont: P)(implicit timeout: Duration) = In[C,A,P](c, cont, timeout)
 
-  def branchCase[T, P](cont: P)(implicit ev: P <:< (T => Process)) = Match[T, P](cont)
+  def branch[A, Chans <: Tuple, Matches <: Tuple](
+    channels: Chans, matches: Matches
+  )(using ValidBranch[A, Chans, Matches])(implicit timeout: Duration) =
+    Branch[A, Chans, Matches](channels, matches, timeout)
 
-  def branch[C <: InChannel[A], A, Matches <: MatchList](c: C)(matches: Matches)(
-    using ValidMatches[Matches, A]
-  )(implicit timeout: Duration) = Branch[C, A, Matches](c, matches, timeout)
-
+  // Helper for branch, when there is only a single channel
+  def branch1[A, Chan <: InChannel[A], Matches <: Tuple](
+    channel: Chan, matches: Matches
+  )(using ValidBranch[A, Tuple1[Chan], Matches])(implicit timeout: Duration) =
+    Branch[A, Tuple1[Chan], Matches](Tuple1(channel), matches, timeout)
+  
   /** Fork `p` as a separate process.
   *
   * NOTE: in practice, you might probably want to use [[par]].
