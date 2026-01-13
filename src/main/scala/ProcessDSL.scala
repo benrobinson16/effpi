@@ -6,6 +6,7 @@ package effpi.process
 import effpi.channel._
 import effpi.system._
 import scala.concurrent.duration.Duration
+import scala.reflect.{ClassTag, TypeTest}
 import scala.util.{Failure, Success, Try}
 
 // WARNING: double-check variance
@@ -68,6 +69,27 @@ case class >>:[P1 <: Process, P2 <: Process](p1: () => P1, p2: () => P2) extends
 type ArgumentOf[F] = F match
   case Function1[i, ?] => i
 
+// Wrapper that stores a continuation function along with runtime type information
+case class MatchCase[A, B, P <: Process](cont: B => P, typeTest: TypeTest[A, B]) {
+  // Try to match a value of type A against type B, and apply continuation if successful
+  def tryMatch(value: A): Option[P] = {
+    value match {
+      case typeTest(v) => Some(cont(v))
+      case _ => None
+    }
+  }
+}
+
+// Typeclass to automatically wrap a tuple of match functions with TypeTests
+trait WrapMatches[A, Matches <: Tuple] {
+  type Wrapped <: Tuple
+  def wrap(matches: Matches): Wrapped
+}
+
+object WrapMatches {
+  type Aux[A, Matches <: Tuple, W <: Tuple] = WrapMatches[A, Matches] { type Wrapped = W }
+}
+
 // Enforce constraints on the channels and match cases of a Branch
 sealed trait ValidBranch[A, Chans <: Tuple, Matches <: Tuple]
 object ValidBranch {
@@ -89,15 +111,37 @@ object ValidBranch {
     // // Each case only accepts inputs belonging to A
     // ev3: Tuple.Union[Tuple.Map[Matches, ArgumentOf]] <:< A,
 
-    // // The match cases cover all possible inputs of A
+    // // // The match cases cover all possible inputs of A
     // ev4: A <:< Tuple.Union[Tuple.Map[Matches, ArgumentOf]]
   ): ValidBranch[A, Chans, Matches] with {}
 }
 
 case class Branch[A, Chans <: Tuple, Matches <: Tuple]
   (channels: Chans, matches: Matches, timeout: Duration)
-  (using ValidBranch[A, Chans, Matches])
-  extends Process
+  (using val valid: ValidBranch[A, Chans, Matches], val wrapper: WrapMatches[A, Matches])
+  extends Process {
+
+  // Lazily computed wrapped matches with runtime type information
+  lazy val wrappedMatches: wrapper.Wrapped = wrapper.wrap(matches)
+
+  // Find the first matching case for a received value
+  // Returns the continuation process that matches the value's type
+  def findMatch(value: A): Option[Process] = {
+    def tryMatches(remaining: Tuple): Option[Process] = remaining match {
+      case h *: tail =>
+        h match {
+          case mc: MatchCase[A, _, _] =>
+            mc.tryMatch(value) match {
+              case Some(p) => Some(p)
+              case None => tryMatches(tail)
+            }
+          case _ => None
+        }
+      case EmptyTuple => None
+    }
+    tryMatches(wrappedMatches)
+  }
+}
 
 // Helper for Branch - we can't write Branch[A, (InChannel[A]), ...] and
 // it is awkward to define Branch[A, InChannel[A] *: EmptyTuple, ...]
@@ -210,13 +254,13 @@ package object dsl {
 
   def branch[A, Chans <: Tuple, Matches <: Tuple](
     channels: Chans, matches: Matches
-  )(using ValidBranch[A, Chans, Matches])(implicit timeout: Duration) =
+  )(using ValidBranch[A, Chans, Matches], WrapMatches[A, Matches])(implicit timeout: Duration) =
     Branch[A, Chans, Matches](channels, matches, timeout)
 
   // Helper for branch, when there is only a single channel
   def branch1[A, Chan <: InChannel[A], Matches <: Tuple](
     channel: Chan, matches: Matches
-  )(using ValidBranch[A, Tuple1[Chan], Matches])(implicit timeout: Duration) =
+  )(using ValidBranch[A, Tuple1[Chan], Matches], WrapMatches[A, Matches])(implicit timeout: Duration) =
     Branch[A, Tuple1[Chan], Matches](Tuple1(channel), matches, timeout)
   
   /** Fork `p` as a separate process.
@@ -344,11 +388,68 @@ package object dsl {
         // We received a tuple containing a value and an ack channel
         val (v2, ack) = v.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
         ack.send(())
-        i.cont.asInstanceOf[Any => Process](v2)  
+        i.cont.asInstanceOf[Any => Process](v2)
       } else {
         i.cont.asInstanceOf[Any => Process](v)
       }
       eval(env, lp, cont)
+    }
+    case b: Branch[_, _, _] => {
+      val startTime = System.nanoTime()
+      val timeoutNanos = b.timeout.toNanos
+
+      // Keep polling all channels until we get a message or timeout
+      @annotation.tailrec
+      def pollUntilTimeout(): (Any, Boolean) = {
+        val elapsed = System.nanoTime() - startTime
+        if (elapsed >= timeoutNanos) {
+          throw new java.util.concurrent.TimeoutException(
+            "Branch: No message received from any channel within timeout"
+          )
+        }
+
+        // Shuffle the channels
+        var shuffledChannels = scala.util.Random.shuffle(b.channels.toList)
+        var result: Option[(Any, Boolean)] = None
+
+        while (!shuffledChannels.isEmpty && result == None) {
+          val channel = shuffledChannels.head
+          shuffledChannels = shuffledChannels.tail
+
+          val ic = channel.asInstanceOf[InChannel[Any]]
+          ic.poll() match {
+            case Some(res) => result = Some((res, ic.synchronous))
+            case None => ()
+          }
+        }
+
+        result match {
+          case Some(res) => res
+          case None =>
+            // No message yet, yield and retry
+            Thread.`yield`()
+            pollUntilTimeout()
+        }
+      }
+
+      val (rawValue, isSynchronous) = pollUntilTimeout()
+
+      // Handle synchronous channels
+      val actualValue = if (isSynchronous) {
+        val (v2, ack) = rawValue.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
+        ack.send(())
+        v2
+      } else {
+        rawValue
+      }
+
+      // Find the matching continuation based on the value's type
+      // Cast to the existential type A from Branch[A, _, _]
+      b.asInstanceOf[Branch[Any, _, _]].findMatch(actualValue) match {
+        case Some(cont) => eval(env, lp, cont)
+        case None =>
+          throw new RuntimeException(s"Branch: No matching case for received value: $actualValue")
+      }
     }
     case o: Out[_,_] => {
       val oc = o.channel.asInstanceOf[OutChannel[Any]]
