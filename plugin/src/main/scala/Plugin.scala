@@ -192,7 +192,11 @@ object Verifier {
     }
 
     def OutChannel(implicit ctx: Context) = {
-      requiredClassRef("effpi.channel.InChannel").symbol.asClass
+      requiredClassRef("effpi.channel.OutChannel").symbol.asClass
+    }
+
+    def Channel(implicit ctx: Context) = {
+      requiredClassRef("effpi.channel.Channel").symbol.asClass
     }
 
     def Behavior(implicit ctx: Context) = {
@@ -235,6 +239,9 @@ object Verifier {
     }
     def ProcVar(implicit ctx: Context) = {
       requiredClassRef("effpi.process.ProcVar").symbol.asClass
+    }
+    def Branch(implicit ctx: Context) = {
+      requiredClassRef("effpi.process.Branch").symbol.asClass
     }
   }
 
@@ -647,7 +654,7 @@ class VerifierPhase(keepTmp: Boolean,
               // We will recognise uses of mailbox(es) as In[Mailbox...]
               toBehType(args(1))
             } else {
-              report.log(s"Unsupported implicit function application: ${r2}")
+              report.warning(s"Unsupported implicit function application: ${r2}")
               None
             }
           }
@@ -685,18 +692,18 @@ class VerifierPhase(keepTmp: Boolean,
               if (args(2) == args(3)) {
                 for { body <- toBehType(args(3)) } yield RecDef(ref.show, body)
               } else {
-                report.log(s"Def: mismatching body and continuation:\n${args(3)}\n${args(4)}")
+                report.warning(s"Def: mismatching body and continuation:\n${args(3)}\n${args(4)}")
                 None
               }
             }
             case _ => {
               // For now, we only support simple recursion without parameters
-              report.log(s"Def: unsupported recursion argument type: ${args(1)}")
+              report.warning(s"Def: unsupported recursion argument type: ${args(1)}")
               None
             }
           }
           case _ => {
-            report.log(s"Def: unsupported recursion variable: ${args(0)}")
+            report.warning(s"Def: unsupported recursion variable: ${args(0)}")
             None
           }
         }
@@ -709,17 +716,47 @@ class VerifierPhase(keepTmp: Boolean,
             }
             case _ => {
               // For now, we only support simple recursion without parameters
-              report.log(s"Call: unsupported recursion argument type: ${args(1)}")
+              report.warning(s"Call: unsupported recursion argument type: ${args(1)}")
               None
             }
           }
           case _ => {
-            report.log(s"Call: unsupported recursion variable: ${args(0)}")
+            report.warning(s"Call: unsupported recursion variable: ${args(0)}")
             None
           }
         }
+      } else if (r.typeSymbol == DSL.Branch) {
+        assert(args.length == 3)
+
+        val channels = extractTuple(args(1))
+        val matches = extractTuple(args(2))
+
+        val compatiblePairs = findCompatiblePairs(channels, matches)
+
+        if (compatiblePairs.isEmpty) {
+          report.warning(s"Branch: no compatible code paths found")
+          None
+        } else {
+          val alternatives: List[Option[BehType]] = compatiblePairs
+            .map { case (chan, cont, intersection) => 
+              for {
+                c <- toValueType(chan)
+                d <- toDepFun(cont)
+                // Might need to correct the DepFun's argtype to be the intersection?
+                intersectionVT <- toValueType(intersection)
+                // // correctedDepFun = d.copy(argtype = intersectionVT)(d.orig)
+                // // correctedDepFun = DepFun(TypeVar(d.arg.name, intersectionVT)(d.arg.orig), intersectionVT, d.ret)(d.orig)
+                newArg = TypeVar(d.arg.name, intersectionVT)(d.arg.orig)
+                correctedRet = d.ret.subst(d.arg, newArg)  // Replace old TypeVar with new one
+                correctedDepFun = DepFun(newArg, intersectionVT, correctedRet)(d.orig)
+              } yield In(c, correctedDepFun)
+            }
+
+          // Combine with Or
+          optList(alternatives).map { alts => alts.reduceRight((a, b) => Or(a, b)) }
+        }
       } else {
-        report.log(s"App: unsupported TypeSymbol: ${r.typeSymbol}")
+        report.warning(s"App: unsupported TypeSymbol: ${r.typeSymbol}")
         None
       }
     }
@@ -728,7 +765,7 @@ class VerifierPhase(keepTmp: Boolean,
     }
     case _ => None
   }) orElse {
-    report.log(s"Cannot convert to behavioral type:\n${t}")
+    report.warning(s"Cannot convert to behavioral type:\n${t}")
     None
   }
 
@@ -753,8 +790,9 @@ class VerifierPhase(keepTmp: Boolean,
     case ParamRef(r) => toTypeVar(t)
     case np: NoPrefix => Some(np)
     case tb: TypeBounds => Some(tb)
+    case ot: OrType => Some(GroundType(ot.orig))
     case _ => {
-      report.log(s"Cannot convert to ValueType: ${t}")
+      report.warning(s"Cannot convert to ValueType: ${t}")
       None
     }
   }
@@ -773,7 +811,7 @@ class VerifierPhase(keepTmp: Boolean,
     case m @ MethodType(paramNames, paramTypes, ret) => {
       assert(paramNames.length == paramTypes.length)
       if (paramNames.length != 1) {
-        report.log(s"toDepFun: cannot convert MethodType with 2+ parameters: ${t}")
+        report.warning(s"toDepFun: cannot convert MethodType with 2+ parameters: ${t}")
         None
       } else {
         for {
@@ -788,7 +826,7 @@ class VerifierPhase(keepTmp: Boolean,
     // } yield DepFun(/* TODO: create a fresh name here*/, argt, rett)
     case _ => None
   }) orElse {
-    report.log(s"Cannot convert to ${DepFun.getClass.getName}: ${t}")
+    report.warning(s"Cannot convert to ${DepFun.getClass.getName}: ${t}")
     None
   }
 
@@ -825,6 +863,79 @@ class VerifierPhase(keepTmp: Boolean,
           }
         }
       }).getOrElse(None)
+    }
+  }
+
+  // FIXME Handle Tuple1?
+  // Extract a tuple type to a list of types
+  // Important to handle both TupleN[...] and *:
+  private def extractTuple(t: SimpleType)(implicit ctx: Context): List[SimpleType] = t match {
+    case App(TypeRef(r), args) if r.typeSymbol.fullName.toString.startsWith("scala.Tuple") => {
+      args.toList
+    }
+    case App(TypeRef(r), args) if (r.show == "scala.*:" || r.typeSymbol.fullName.toString == "scala.*:") && args.length == 2 => {
+      args(0) :: extractTuple(args(1))
+    }
+    case TypeRef(r) if r.show == "scala.EmptyTuple" || r.typeSymbol.fullName.toString == "scala.EmptyTuple" => {
+      Nil
+    }
+    case _ => {
+      report.log(s"extractTuple: unexpected tuple type: ${t}")
+      List(t)
+    }
+  }
+
+  private def extractChannelPayload(chan: SimpleType)
+                                    (implicit ctx: Context): Option[SimpleType] = chan match {
+    case App(TypeRef(r), args) if r.typeSymbol == DSL.InChannel || r.typeSymbol == DSL.Channel => {
+      // Handle InChannel[T] and Channel[T]
+      assert(args.length == 1)
+      Some(args(0))
+    }
+    case TermRef(_, _) => {
+      // Handle type parameters that are channels by widening and recursing
+      simplify(chan.orig.widen).flatMap(extractChannelPayload)
+    }
+    case _ => None
+  }
+
+  private def extractMatchArg(matchFn: SimpleType)
+                            (implicit ctx: Context): Option[SimpleType] = matchFn match {
+    case MethodType(_, paramTypes, _) if paramTypes.nonEmpty => Some(paramTypes(0))
+    // FIXME Handle Function1[A, B] written A => B ?
+    case _ => None
+  }
+
+  // Returns (channel, continuation, intersection type)
+  private def findCompatiblePairs(channels: List[SimpleType],
+                                  matches: List[SimpleType])
+                                  (implicit ctx: Context): List[(SimpleType, SimpleType, SimpleType)] = { 
+    val pairs = for {
+      (chan, payload) <- channels
+        .map { c => (c, extractChannelPayload(c)) }
+        .collect { case (c, Some(payload)) => (c, payload) }
+
+      (cont, matchArg) <- matches
+        .map { m => (m, extractMatchArg(m)) }
+        .collect { case (m, Some(arg)) => (m, arg) }
+    } yield {
+      if (typesIntersect(payload, matchArg)) {
+        val interType = if (payload.orig <:< matchArg.orig) payload
+                        else if (matchArg.orig <:< payload.orig) matchArg
+                        else payload
+        
+        Some((chan, cont, interType))
+      } else None
+    }
+
+    pairs.flatten
+  }
+
+  private def typesIntersect(t1: SimpleType, t2: SimpleType)
+                        (implicit ctx: Context): Boolean = (t1, t2) match {
+    // FIXME Handle OrType explicitly?
+    case _ => {
+      t1.orig <:< t2.orig || t2.orig <:< t1.orig
     }
   }
 }
