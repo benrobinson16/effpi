@@ -64,6 +64,12 @@ sealed abstract class BehType {
     }
     case Fork(forked) => forked.mailboxes
     case Or(opt1, opt2) => opt1.mailboxes ++ opt2.mailboxes
+    case ExternalChoice(alts) => alts.flatMap {
+      case In(chan, cont) => chan match {
+        case m: Mailbox => Set(m) ++ cont.ret.mailboxes
+        case _ => cont.ret.mailboxes
+      }
+    }.toSet
     case Seq(pre, post) => pre.mailboxes ++ post.mailboxes
     case RecDef(_name, body) => body.mailboxes
   }
@@ -91,18 +97,40 @@ sealed abstract class BehType {
     }
     case Fork(forked) => forked.fullEnv(observed, env)
     case Or(opt1, opt2) => opt2.fullEnv(observed, opt1.fullEnv(observed, env))
+    case ExternalChoice(alts) => alts.foldLeft(env) { (accEnv, in) =>
+      in.chan match {
+        case v: TypeVar => {
+          if (observed.contains(v)) {
+            in.cont.ret.fullEnv(observed, accEnv + SyntTypeVar.fresh(in.cont.argtype.orig))
+          } else {
+            in.cont.ret.fullEnv(observed, accEnv)
+          }
+        }
+        case m: Mailbox => {
+          if (observed.contains(m)) {
+            in.cont.ret.fullEnv(observed, accEnv + SyntTypeVar.fresh(in.cont.argtype.orig))
+          } else {
+            in.cont.ret.fullEnv(observed, accEnv)
+          }
+        }
+        case _ => in.cont.ret.fullEnv(observed, accEnv)
+      }
+    }
     case Seq(pre, post) => post.fullEnv(observed, pre.fullEnv(observed, env))
     case RecDef(_name, body) => body.fullEnv(observed, env)
   }
 
   /** Substitute the given TypeVar with the given ValueType */
-  def subst(x: TypeVar, v: ValueType): BehType = this match {
+  def subst(x: TypeVar, v: ValueType)(implicit ctx: Context): BehType = this match {
     case PNil => PNil
     case In(chan, cont) => In(chan.subst(x, v), cont.subst(x, v))
     case Out(chan, value) => Out(chan.subst(x, v), value.subst(x, v))
     case Fork(forked) => Fork(forked.subst(x, v))
     case Or(opt1, opt2) => Or(opt1.subst(x, v), opt2.subst (x, v))
     case Seq(pre, post) => Seq(pre.subst(x, v), post.subst(x, v))
+    case ExternalChoice(alts) => ExternalChoice(alts.map {
+      case In(chan, depfun) => In(chan.subst(x, v), depfun.subst(x, v))
+    })
     case RecDef(name, body) => RecDef(name, body.subst(x, v))
     case rv: RecVar => rv
   }
@@ -113,6 +141,7 @@ case class In(chan: ValueType, cont: DepFun) extends BehType
 case class Out(chan: ValueType, value: ValueType) extends BehType
 case class Fork(forked: BehType) extends BehType
 case class Or(opt1: BehType, opt2: BehType) extends BehType
+case class ExternalChoice(alternatives: List[In]) extends BehType
 case class Seq(pre: BehType, post: BehType) extends BehType
 case class RecDef(name: String, body: BehType) extends BehType
 case class RecVar(name: String) extends BehType
@@ -133,7 +162,7 @@ sealed abstract trait ValueType(val orig: Types.Type) {
   *
   * Note that the resulting ValueType will preserve the orig field
   */
-  def subst(x: TypeVar, v: ValueType): ValueType = this match {
+  def subst(x: TypeVar, v: ValueType)(implicit ctx: Context): ValueType = this match {
     case df: DepFun => df.subst(x, v)
     case gt: GroundType => gt
     case at: AppType => at
@@ -147,7 +176,7 @@ sealed abstract trait ValueType(val orig: Types.Type) {
 }
 case class DepFun(arg: TypeVar, argtype: ValueType, ret: BehType)(override val orig: Types.Type) extends ValueType(orig) {
   /** Override method to refine return type */
-  override def subst(x: TypeVar, v: ValueType): DepFun = {
+  override def subst(x: TypeVar, v: ValueType)(implicit ctx: Context): DepFun = {
     this.copy(ret = ret.subst(x, v))(orig)
   }
 }
@@ -737,23 +766,32 @@ class VerifierPhase(keepTmp: Boolean,
           report.warning(s"Branch: no compatible code paths found")
           None
         } else {
-          val alternatives: List[Option[BehType]] = compatiblePairs
-            .map { case (chan, cont, intersection) => 
+          val alternatives: List[Option[In]] = compatiblePairs
+            .map { case (chan, cont, intersection) =>
               for {
                 c <- toValueType(chan)
                 d <- toDepFun(cont)
-                // Might need to correct the DepFun's argtype to be the intersection?
+                // Correct the DepFun's argtype to be the intersection
                 intersectionVT <- toValueType(intersection)
-                // // correctedDepFun = d.copy(argtype = intersectionVT)(d.orig)
-                // // correctedDepFun = DepFun(TypeVar(d.arg.name, intersectionVT)(d.arg.orig), intersectionVT, d.ret)(d.orig)
                 newArg = TypeVar(d.arg.name, intersectionVT)(d.arg.orig)
                 correctedRet = d.ret.subst(d.arg, newArg)  // Replace old TypeVar with new one
                 correctedDepFun = DepFun(newArg, intersectionVT, correctedRet)(d.orig)
               } yield In(c, correctedDepFun)
             }
 
-          // Combine with Or
-          optList(alternatives).map { alts => alts.reduceRight((a, b) => Or(a, b)) }
+          // Group by channel to determine choice type
+          optList(alternatives).map { alts =>
+            val byChannel = alts.groupBy(_.chan)
+
+            if (byChannel.size == 1) {
+              // Single channel with multiple continuations → internal choice (Or)
+              if (alts.length == 1) alts.head: BehType
+              else alts.map(a => a: BehType).reduceRight((a, b) => Or(a, b))
+            } else {
+              // Multiple channels → external choice
+              ExternalChoice(alts): BehType
+            }
+          }
         }
       } else {
         report.warning(s"App: unsupported TypeSymbol: ${r.typeSymbol}")

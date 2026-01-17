@@ -207,6 +207,36 @@ object CCST {
       if (pre2.sequential && !pre2.recursive)
       post2 <- apply(post, obs, probes, outputs)
     } yield pre2.concat(post2)
+    case verif.ExternalChoice(ins) => {
+      // Merge all input alternatives into a single Branch (external choice)
+      val allBranches: Option[List[(In, CCST)]] = optList(
+        ins.flatMap { in =>
+          val observed = obs.exists { o => in.chan.orig <:< o.orig }
+          List(for {
+            b <- apply(in.cont.ret.subst(in.cont.arg, in.cont.argtype), obs, probes, outputs)
+          } yield (In(in.chan, in.cont.argtype), b)) ++ {
+            if (observed) {
+              probes.filter(p => p.orig <:< in.cont.argtype.orig).map { p =>
+                report.log(s"Expanding branching for:\nprobe: ${p}\ntype: ${in.cont.argtype.orig}")
+                for {
+                  b <- apply(in.cont.ret.subst(in.cont.arg, p), obs, probes, outputs)
+                } yield (In(in.chan, p), b)
+              }.toList
+            } else Nil
+          } ++ {
+            import effpi.verifier.Verifier.canCommunicate
+            outputs.filter(o => canCommunicate(in.chan, o.chan)).map { o =>
+              report.log(s"Expanding branching for:\noutput on: ${o.chan}\ntype: ${o.payload.orig}")
+              for {
+                b <- apply(in.cont.ret.subst(in.cont.arg, o.payload), obs, probes, outputs)
+              } yield (In(o.chan, o.payload), b)
+            }.toSeq
+          }
+        }
+      )
+
+      allBranches.map(bs => Branch(Map(bs:_*)))
+    }
     case verif.Or(b1, b2) => for {
       p1 <- apply(b1, obs, probes, outputs)
       p2 <- apply(b2, obs, probes, outputs)

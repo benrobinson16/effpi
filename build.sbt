@@ -128,7 +128,7 @@ lazy val examples = project
     name := "effpi-examples",
     version := effpiVersion,
     scalaVersion := dottyVersion,
-    scalacOptions ++= pluginOpts(true, false).value,
+    scalacOptions ++= pluginOpts(false, false).value,
   )
 
 lazy val pluginBenchmarks = project
