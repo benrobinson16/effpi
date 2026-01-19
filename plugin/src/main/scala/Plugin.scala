@@ -64,12 +64,10 @@ sealed abstract class BehType {
     }
     case Fork(forked) => forked.mailboxes
     case Or(opt1, opt2) => opt1.mailboxes ++ opt2.mailboxes
-    case ExternalChoice(alts) => alts.flatMap {
-      case In(chan, cont) => chan match {
-        case m: Mailbox => Set(m) ++ cont.ret.mailboxes
-        case _ => cont.ret.mailboxes
-      }
-    }.toSet
+    case Branch(chans, continuations) => chans.flatMap {
+      case m: Mailbox => Some(m)
+      case _ => None
+    }.toSet ++ continuations.flatMap(_.ret.mailboxes).toSet
     case Seq(pre, post) => pre.mailboxes ++ post.mailboxes
     case RecDef(_name, body) => body.mailboxes
   }
@@ -97,23 +95,25 @@ sealed abstract class BehType {
     }
     case Fork(forked) => forked.fullEnv(observed, env)
     case Or(opt1, opt2) => opt2.fullEnv(observed, opt1.fullEnv(observed, env))
-    case ExternalChoice(alts) => alts.foldLeft(env) { (accEnv, in) =>
-      in.chan match {
-        case v: TypeVar => {
-          if (observed.contains(v)) {
-            in.cont.ret.fullEnv(observed, accEnv + SyntTypeVar.fresh(in.cont.argtype.orig))
-          } else {
-            in.cont.ret.fullEnv(observed, accEnv)
-          }
-        }
-        case m: Mailbox => {
-          if (observed.contains(m)) {
-            in.cont.ret.fullEnv(observed, accEnv + SyntTypeVar.fresh(in.cont.argtype.orig))
-          } else {
-            in.cont.ret.fullEnv(observed, accEnv)
-          }
-        }
-        case _ => in.cont.ret.fullEnv(observed, accEnv)
+    case Branch(chans, continuations) => {
+      // FIXME IS THIS RIGHT???
+      // The code below introduces a new probe for EVERY continuation if
+      // ANY of the input channels are observed. Should this be per-channel?
+      // Should the input types of the channels be used for the SyntTypeVar
+      // rather than the continuation argtypes? Should we limit to only the
+      // continuations which are reachable from the observed channels?
+
+      val chanObserved = chans.exists {
+        case v: TypeVar if observed.contains(v) => true
+        case m: Mailbox if observed.contains(m) => true
+        case _ => false
+      }
+
+      val initialEnv = if (chanObserved) env ++ continuations.map { cont => SyntTypeVar.fresh(cont.argtype.orig) }
+                       else env          
+
+      continuations.foldLeft(initialEnv) { (accEnv, cont) =>
+        cont.ret.fullEnv(observed, accEnv)
       }
     }
     case Seq(pre, post) => post.fullEnv(observed, pre.fullEnv(observed, env))
@@ -128,9 +128,10 @@ sealed abstract class BehType {
     case Fork(forked) => Fork(forked.subst(x, v))
     case Or(opt1, opt2) => Or(opt1.subst(x, v), opt2.subst (x, v))
     case Seq(pre, post) => Seq(pre.subst(x, v), post.subst(x, v))
-    case ExternalChoice(alts) => ExternalChoice(alts.map {
-      case In(chan, depfun) => In(chan.subst(x, v), depfun.subst(x, v))
-    })
+    case Branch(chans, continuations) => Branch(
+      chans.map(_.subst(x, v)),
+      continuations.map(_.subst(x, v))
+    )
     case RecDef(name, body) => RecDef(name, body.subst(x, v))
     case rv: RecVar => rv
   }
@@ -141,7 +142,7 @@ case class In(chan: ValueType, cont: DepFun) extends BehType
 case class Out(chan: ValueType, value: ValueType) extends BehType
 case class Fork(forked: BehType) extends BehType
 case class Or(opt1: BehType, opt2: BehType) extends BehType
-case class ExternalChoice(alternatives: List[In]) extends BehType
+case class Branch(chans: List[ValueType], continuations: List[DepFun]) extends BehType
 case class Seq(pre: BehType, post: BehType) extends BehType
 case class RecDef(name: String, body: BehType) extends BehType
 case class RecVar(name: String) extends BehType
@@ -326,6 +327,17 @@ object Verifier {
     //if (ret) report.log(s"Can communicate:\n${t1.orig.show}\n${t2.orig.show}")
     //else report.log(s"Cannot communicate:\n${t1.orig.show}\n${t2.orig.show}")
     ret
+  }
+
+  // Get the payload type of a channel
+  def extractChannelPayload(chan: ValueType)(implicit ctx: Context): Option[Types.Type] = chan match {
+    case AppType(tcons, args) if tcons.typeSymbol == DSL.InChannel || tcons.typeSymbol == DSL.Channel => {
+      assert(args.length == 1)
+      Some(args(0).orig)
+    }
+    case TypeVar(_, widened) => extractChannelPayload(widened)
+    case TypeVarPrefix(_, tvar) => extractChannelPayload(tvar)
+    case _ => None
   }
 }
 
@@ -757,41 +769,19 @@ class VerifierPhase(keepTmp: Boolean,
       } else if (r.typeSymbol == DSL.Branch) {
         assert(args.length == 3)
 
-        val channels = extractTuple(args(1))
-        val matches = extractTuple(args(2))
+        val channels = extractTuple(args(1)).map(toValueType(_))
+        val matches = extractTuple(args(2)).map(toDepFun(_))
 
-        val compatiblePairs = findCompatiblePairs(channels, matches)
-
-        if (compatiblePairs.isEmpty) {
-          report.warning(s"Branch: no compatible code paths found")
+        if (channels.exists(_.isEmpty) || matches.exists(_.isEmpty)) {
+          report.warning(s"Branch: unable to convert all channel/match types")
           None
         } else {
-          val alternatives: List[Option[In]] = compatiblePairs
-            .map { case (chan, cont, intersection) =>
-              for {
-                c <- toValueType(chan)
-                d <- toDepFun(cont)
-                // Correct the DepFun's argtype to be the intersection
-                intersectionVT <- toValueType(intersection)
-                newArg = TypeVar(d.arg.name, intersectionVT)(d.arg.orig)
-                correctedRet = d.ret.subst(d.arg, newArg)  // Replace old TypeVar with new one
-                correctedDepFun = DepFun(newArg, intersectionVT, correctedRet)(d.orig)
-              } yield In(c, correctedDepFun)
-            }
+          val channelsVT = channels.map(_.get)
+          val matchesVT = matches.map(_.get)
 
-          // Group by channel to determine choice type
-          optList(alternatives).map { alts =>
-            val byChannel = alts.groupBy(_.chan)
-
-            if (byChannel.size == 1) {
-              // Single channel with multiple continuations → internal choice (Or)
-              if (alts.length == 1) alts.head: BehType
-              else alts.map(a => a: BehType).reduceRight((a, b) => Or(a, b))
-            } else {
-              // Multiple channels → external choice
-              ExternalChoice(alts): BehType
-            }
-          }
+          // FIXME Do we need to do any checks here?
+          // E.g. matches cover all channel types, are distinct, etc?
+          Some(Branch(channelsVT, matchesVT))
         }
       } else {
         report.warning(s"App: unsupported TypeSymbol: ${r.typeSymbol}")
@@ -904,7 +894,6 @@ class VerifierPhase(keepTmp: Boolean,
     }
   }
 
-  // FIXME Handle Tuple1?
   // Extract a tuple type to a list of types
   // Important to handle both TupleN[...] and *:
   private def extractTuple(t: SimpleType)(implicit ctx: Context): List[SimpleType] = t match {
@@ -920,60 +909,6 @@ class VerifierPhase(keepTmp: Boolean,
     case _ => {
       report.log(s"extractTuple: unexpected tuple type: ${t}")
       List(t)
-    }
-  }
-
-  private def extractChannelPayload(chan: SimpleType)
-                                    (implicit ctx: Context): Option[SimpleType] = chan match {
-    case App(TypeRef(r), args) if r.typeSymbol == DSL.InChannel || r.typeSymbol == DSL.Channel => {
-      // Handle InChannel[T] and Channel[T]
-      assert(args.length == 1)
-      Some(args(0))
-    }
-    case TermRef(_, _) => {
-      // Handle type parameters that are channels by widening and recursing
-      simplify(chan.orig.widen).flatMap(extractChannelPayload)
-    }
-    case _ => None
-  }
-
-  private def extractMatchArg(matchFn: SimpleType)
-                            (implicit ctx: Context): Option[SimpleType] = matchFn match {
-    case MethodType(_, paramTypes, _) if paramTypes.nonEmpty => Some(paramTypes(0))
-    // FIXME Handle Function1[A, B] written A => B ?
-    case _ => None
-  }
-
-  // Returns (channel, continuation, intersection type)
-  private def findCompatiblePairs(channels: List[SimpleType],
-                                  matches: List[SimpleType])
-                                  (implicit ctx: Context): List[(SimpleType, SimpleType, SimpleType)] = { 
-    val pairs = for {
-      (chan, payload) <- channels
-        .map { c => (c, extractChannelPayload(c)) }
-        .collect { case (c, Some(payload)) => (c, payload) }
-
-      (cont, matchArg) <- matches
-        .map { m => (m, extractMatchArg(m)) }
-        .collect { case (m, Some(arg)) => (m, arg) }
-    } yield {
-      if (typesIntersect(payload, matchArg)) {
-        val interType = if (payload.orig <:< matchArg.orig) payload
-                        else if (matchArg.orig <:< payload.orig) matchArg
-                        else payload
-        
-        Some((chan, cont, interType))
-      } else None
-    }
-
-    pairs.flatten
-  }
-
-  private def typesIntersect(t1: SimpleType, t2: SimpleType)
-                        (implicit ctx: Context): Boolean = (t1, t2) match {
-    // FIXME Handle OrType explicitly?
-    case _ => {
-      t1.orig <:< t2.orig || t2.orig <:< t1.orig
     }
   }
 }
