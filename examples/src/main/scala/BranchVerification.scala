@@ -1,4 +1,3 @@
-
 package effpi.examples.branchverification
 
 import effpi.channel.{Channel => Chan, InChannel => IChan, OutChannel => OChan}
@@ -11,310 +10,176 @@ package object types {
     case class MsgB(v: String)
     type Message = MsgA | MsgB
 
-    // Producers and consumers...
-
     type Producer[A, C <: OChan[A]] =
         Rec[RecX, Out[C, A] >>: Loop[RecX]]
 
     type Consumer[A, C <: IChan[A]] =
-        Rec[RecX, In[C, A, (x: A) => Loop[RecX]]]
+        Rec[RecY, In[C, A, (x: A) => Loop[RecY]]]
 
-    type ProducerConsumer[C <: Chan[Message]] =
-        Par[Producer[Message, C], Consumer[Message, C]]
-
-    private def producerConsumerCHK(c: Chan[Message]): ProducerConsumer[c.type] = ???
-
-    // Splitter
-
-    type Splitter[In <: IChan[Message], OutA <: OChan[MsgA], OutB <: OChan[MsgB]] =
-        Rec[RecX,
-            Branch1[Message, In, (
-                (m: MsgA) => Out[OutA, m.type] >>: Loop[RecX],
-                (m: MsgB) => Out[OutB, m.type] >>: Loop[RecX]
+    // Splitter...
+        
+    type Splitter[InC <: IChan[Message],
+                  OutA <: OChan[MsgA],
+                  OutB <: OChan[MsgB]] =
+        Rec[RecZ,
+            Branch1[Message, InC, (
+                (m: MsgA) => Out[OutA, m.type] >>: Loop[RecZ],
+                (m: MsgB) => Out[OutB, m.type] >>: Loop[RecZ]
             )]
         ]
 
     @verify(property = "forwarding(in)(outA, outB)")
     def splitterCHK(in: IChan[Message],
                     outA: OChan[MsgA],
-                    outB: OChan[MsgB]): Splitter[in.type,
-                                                outA.type,
-                                                outB.type] = ???
+                    outB: OChan[MsgB]): Splitter[in.type, outA.type, outB.type] = ???
 
-    type SplitterSystem[In <: Chan[Message], OutA <: Chan[MsgA], OutB <: Chan[MsgB]] =
-        Par4[
-            Producer[Message, In],
-            Splitter[In, OutA, OutB],
-            Consumer[MsgA, OutA],
-            Consumer[MsgB, OutB]
-        ]
+    @verify(property = "deadlock_free()")
+    def splitterSystemCHK(in: Chan[Message],
+                          outA: Chan[MsgA],
+                          outB: Chan[MsgB]): Par4[
+      Producer[Message, in.type],
+      Splitter[in.type, outA.type, outB.type],
+      Consumer[MsgA, outA.type],
+      Consumer[MsgB, outB.type]
+    ] = ???
 
-    @verify(property = "deadlock_free()") // Success: deadlock-free
-    private def splitterSystemCHK(in: Chan[Message],
-                            outA: Chan[MsgA],
-                            outB: Chan[MsgB]): SplitterSystem[in.type,
-                                                              outA.type,
-                                                              outB.type] = ???
-
-    type FaultySplitterSystem[In <: Chan[Message], OutA <: Chan[MsgA], OutB <: Chan[MsgB]] =
-        Par3[
-            Producer[Message, In],
-            Splitter[In, OutA, OutB],
-            Consumer[MsgA, OutA],
-            // No consumer for MsgB
-            // Consumer[MsgB, OutB]
-        ]
-
-    @verify(property = "deadlock_free()") // Expect failure: can deadlock
-    private def splitterDeadlockCHK(in: Chan[Message],
-                                    outA: Chan[MsgA],
-                                    outB: Chan[MsgB]): FaultySplitterSystem[in.type,
-                                                                            outA.type,
-                                                                            outB.type] = ???
-
-    // Merger
+    // Merger...
 
     type Merger[InA <: IChan[MsgA], InB <: IChan[MsgB], OutC <: OChan[Message]] =
         Rec[RecX,
             Branch[Message, (InA, InB), Tuple1[
                 (m: Message) => Out[OutC, m.type] >>: Loop[RecX]
+            ]]]
+
+    @verify(property = "forwarding(inA, inB)(outC)")
+    def mergerCHK(inA: IChan[MsgA],
+                  inB: IChan[MsgB],
+                  outC: OChan[Message]): Merger[inA.type, inB.type, outC.type] = ???
+
+    @verify(property = "deadlock_free()")
+    def mergerSystemCHK(inA: Chan[MsgA],
+                        inB: Chan[MsgB],
+                        outC: Chan[Message]): Par4[
+      Producer[MsgA, inA.type],
+      Producer[MsgB, inB.type],
+      Merger[inA.type, inB.type, outC.type],
+      Consumer[Message, outC.type]
+    ] = ???
+
+    // Combined Splitter and Merger...
+
+    type SplitterMerger[InC <: IChan[Message],
+                        MiddleA <: Chan[MsgA],
+                        MiddleB <: Chan[MsgB],
+                        OutC <: OChan[Message]] =
+        Par[
+            Splitter[InC, MiddleA, MiddleB],
+            Merger[MiddleA, MiddleB, OutC]
+        ]
+
+    @verify(property = "forwarding(in)(out)") // Expect failure - could reorder messages by accepting new input on InC before outputting previous message on OutC
+    def splitterMergerCHK(in: IChan[Message],
+                          middleA: Chan[MsgA],
+                          middleB: Chan[MsgB],
+                          out: OChan[Message]): SplitterMerger[in.type, middleA.type, middleB.type, out.type] = ???
+
+    // @verify(property = "deadlock_free()")
+    // def splitterMergerSystemCHK(in: Chan[Message],
+    //                             middleA: Chan[MsgA],
+    //                             middleB: Chan[MsgB],
+    //                             out: Chan[Message]): Par3[
+    //     Producer[Message, in.type],
+    //     SplitterMerger[in.type, middleA.type, middleB.type, out.type],
+    //     Consumer[Message, out.type]
+    // ] = ???
+    
+    // A Splitter-Merger forwarder that ensures messages are forwarded in order
+
+    type ControlledSplitter[InC <: IChan[Message],
+                            OutA <: OChan[MsgA],
+                            OutB <: OChan[MsgB],
+                            Ctrl <: IChan[Unit]] =
+        Rec[RecX,
+            Branch1[Message, InC, (
+                (m: MsgA) => Out[OutA, m.type] >>: In[Ctrl, Unit, (x: Unit) => Loop[RecX]],
+                (m: MsgB) => Out[OutB, m.type] >>: In[Ctrl, Unit, (x: Unit) => Loop[RecX]],
+            )]
+        ]
+
+    type ControlledMerger[InA <: IChan[MsgA],
+                          InB <: IChan[MsgB],
+                          OutC <: OChan[Message],
+                          Ctrl <: OChan[Unit]] =
+        Rec[RecX,
+            Branch[Message, (InA, InB), Tuple1[
+                (m: Message) => Out[OutC, m.type] >>: Out[Ctrl, Unit] >>: Loop[RecX]
             ]]
         ]
 
-    type FaultyForwarder[InC <: Chan[Message], MiddleA <: Chan[MsgA],
-                         MiddleB <: Chan[MsgB], OutC <: Chan[Message]] =
+    type OrderedForwarder[InC <: IChan[Message],
+                          MiddleA <: Chan[MsgA],
+                          MiddleB <: Chan[MsgB],
+                          OutC <: OChan[Message],
+                          Ctrl <: Chan[Unit]] =
+        Par[
+            ControlledSplitter[InC, MiddleA, MiddleB, Ctrl],
+            ControlledMerger[MiddleA, MiddleB, OutC, Ctrl]
+        ]
+
+    @verify(property = "forwarding(in)(out)")
+    def orderedForwarderCHK(in: IChan[Message],
+                            middleA: Chan[MsgA],
+                            middleB: Chan[MsgB],
+                            out: OChan[Message],
+                            ctrl: Chan[Unit]): OrderedForwarder[in.type, middleA.type, middleB.type, out.type, ctrl.type] = ???
+
+    // Let's test this further by forwarding messages from the splitter to the merger
+    // via new channels...
+
+    type SimpleForwarder[A, InC <: IChan[A], OutC <: OChan[A]] =
+        Rec[RecX, In[InC, A, (m: A) => Out[OutC, m.type] >>: Loop[RecX]]]
+
+    type SeparatedOrderedForwarder[InC <: IChan[Message],
+                                    MiddleA1 <: Chan[MsgA],
+                                    MiddleA2 <: Chan[MsgA],
+                                    MiddleB1 <: Chan[MsgB],
+                                    MiddleB2 <: Chan[MsgB],
+                                    OutC <: OChan[Message],
+                                    Ctrl <: Chan[Unit]] =
         Par4[
-            Producer[Message, InC],
-            Splitter[InC, MiddleA, MiddleB],
-            Merger[MiddleA, MiddleB, OutC],
-            Consumer[Message, OutC]
+            ControlledSplitter[InC, MiddleA1, MiddleB1, Ctrl],
+            Rec[RecX, In[MiddleA1, MsgA, (m: MsgA) => Out[MiddleA2, m.type] >>: Loop[RecX]]],
+            Rec[RecX, In[MiddleB1, MsgB, (m: MsgB) => Out[MiddleB2, m.type] >>: Loop[RecX]]],
+            ControlledMerger[MiddleA2, MiddleB2, OutC, Ctrl]
         ]
 
-    @verify(property = "forwarding(in)(out)") // Expect failure: could re-order messages
-    def faultyForwarderCHK(in: Chan[Message],
-                      middleA: Chan[MsgA],
-                      middleB: Chan[MsgB],
-                      out: Chan[Message]): FaultyForwarder[in.type,
-                                                           middleA.type,
-                                                           middleB.type,
-                                                           out.type] = ???
+    @verify(property = "forwarding(in)(out)") // Expect success, but fails FIXME
+    def separatedOrderedForwarderCHK(in: IChan[Message],
+                                     middleA1: Chan[MsgA],
+                                     middleA2: Chan[MsgA],
+                                     middleB1: Chan[MsgB],
+                                     middleB2: Chan[MsgB],
+                                     out: OChan[Message],
+                                     ctrl: Chan[Unit]): SeparatedOrderedForwarder[in.type, middleA1.type, middleA2.type, middleB1.type, middleB2.type, out.type, ctrl.type] = ???
 
-    type ControlledProducer[A, C <: OChan[A], Ctrl <: IChan[Unit]] =
-        Rec[RecX,
-            Out[C, A] >>: In[Ctrl, Unit, (x: Unit) => Loop[RecX]]
-        ]
-    
-    type ConsumerWithControl[A, C <: IChan[A], Ctrl <: OChan[Unit]] =
-        Rec[RecX,
-            In[C, A, (x: A) => Out[Ctrl, Unit] >>: Loop[RecX]]
-        ]
+    // Let's try a forwarder of the same design but without the branch operation
 
-    type Forwarder[InC <: IChan[Message],
-                   MiddleA <: Chan[MsgA],
-                   MiddleB <: Chan[MsgB],
-                   OutC <: OChan[Message],
-                   Ctrl <: Chan[Unit]] =
-        Par[
-            Rec[RecX,
-                Branch1[Message, InC, (
-                    (m: MsgA) => Out[MiddleA, m.type] >>: In[Ctrl, Unit, (x: Unit) => Loop[RecX]],
-                    (m: MsgB) => Out[MiddleB, m.type] >>: In[Ctrl, Unit, (x: Unit) => Loop[RecX]]
-                )]
-            ],
-            Rec[RecY,
-                Branch[Message, (MiddleA, MiddleB), Tuple1[
-                    (m: Message) => Out[OutC, m.type] >>: Out[Ctrl, Unit] >>: Loop[RecY]
-                ]]
-            ]
+    type NondeterministicForwarder[InC <: IChan[Message], MiddleA1 <: Chan[Message], MiddleA2 <: Chan[Message], MiddleB1 <: Chan[Message], MiddleB2 <: Chan[Message], OutC <: OChan[Message], Ctrl <: Chan[Unit]] =
+        Par5[
+            Rec[RecX, In[InC, Message, (m: Message) => (Out[MiddleA1, m.type] >>: In[Ctrl, Unit, (x: Unit) => Loop[RecX]])
+                                                        | (Out[MiddleB1, m.type] >>: In[Ctrl, Unit, (x: Unit) => Loop[RecX]])]],
+            Rec[RecX, In[MiddleA1, Message, (m: Message) => Out[MiddleA2, m.type] >>: Loop[RecX]]],
+            Rec[RecX, In[MiddleB1, Message, (m: Message) => Out[MiddleB2, m.type] >>: Loop[RecX]]],
+            Rec[RecX, In[MiddleA2, Message, (m: Message) => Out[OutC, m.type] >>: Out[Ctrl, Unit] >>: Loop[RecX]]],
+            Rec[RecX, In[MiddleB2, Message, (m: Message) => Out[OutC, m.type] >>: Out[Ctrl, Unit] >>: Loop[RecX]]],
         ]
 
-    // @verify(property = "forwarding(in)(out)(middleA, middleB)") // Success: preserves message order
-    def forwarderCHK(in: IChan[Message],
-                     middleA: Chan[MsgA],
-                     middleB: Chan[MsgB],
-                     out: OChan[Message],
-                     ctrl: Chan[Unit]): Forwarder[in.type,
-                                                  middleA.type,
-                                                  middleB.type,
-                                                  out.type,
-                                                  ctrl.type] = ???
-
-    // Simpler examples
-
-    type SimpleForwarder[InC <: IChan[Int], OutC <: OChan[Int]] =
-        Branch1[Int, InC, Tuple1[
-            (m: Int) => Out[OutC, m.type]
-        ]]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarderCHK(in: IChan[Int],
-                           out: OChan[Int]): SimpleForwarder[in.type,
-                                                              out.type] = ???
-
-    type SimpleForwarder2[InC <: IChan[Int | String], OutC <: OChan[Int | String]] =
-        Branch1[Int | String, InC, (
-            (m: Int) => Out[OutC, m.type],
-            (m: String) => Out[OutC, m.type]
-        )]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarder2CHK(in: IChan[Int | String],
-                            out: OChan[Int | String]): SimpleForwarder2[in.type,
-                                                                       out.type] = ???
-
-    type SimpleForwarder3[InC <: IChan[Int | String], OutC <: OChan[Int | String]] =
-        Rec[RecX, 
-            Branch1[Int | String, InC, (
-                (m: Int) => Out[OutC, m.type] >>: Loop[RecX],
-                (m: String) => Out[OutC, m.type] >>: Loop[RecX]
-            )]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarder3CHK(in: IChan[Int | String],
-                            out: OChan[Int | String]): SimpleForwarder3[in.type,
-                                                                        out.type] = ???
-
-    type SimpleForwarder4[InC <: IChan[Message], OutC <: OChan[Message]] =
-        Rec[RecX,
-            Branch1[Message, InC, (
-                (m: MsgA) => Out[OutC, m.type] >>: Loop[RecX],
-                (m: MsgB) => Out[OutC, m.type] >>: Loop[RecX]
-            )]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarder4CHK(in: IChan[Message],
-                            out: OChan[Message]): SimpleForwarder4[in.type,
-                                                                     out.type] = ???
-
-    type SimpleForwarder5[InC <: IChan[Int], MiddleC <: Chan[Int], OutC <: OChan[Int]] =
-        Par[
-            SimpleForwarder[InC, MiddleC],
-            SimpleForwarder[MiddleC, OutC]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarder5CHK(in: IChan[Int],
-                            middle: Chan[Int],
-                            out: OChan[Int]): SimpleForwarder5[in.type,
-                                                                middle.type,
-                                                                out.type] = ???
-
-    type SimpleForwarder6[InC <: IChan[Int], OutC <: OChan[Int]] =
-        Branch1[Int | String, InC, (
-            (m: Int) => Out[OutC, m.type],
-            (m: String) => PNil
-        )]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarder6CHK(in: IChan[Int],
-                            out: OChan[Int]): SimpleForwarder6[in.type,
-                                                               out.type] = ???
-
-    type SimpleForwarder7[InC <: IChan[Message], MiddleC <: Chan[Message], OutC <: OChan[Message]] =
-        Par[
-            Branch1[Message, InC, (
-                (m: MsgA) => Out[MiddleC, m.type],
-                (m: MsgB) => Out[MiddleC, m.type]
-            )],
-            Branch1[Message, MiddleC, (
-                (m: MsgA) => Out[OutC, m.type],
-                (m: MsgB) => Out[OutC, m.type]
-            )]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarder7CHK(in: IChan[Message],
-                            middle: Chan[Message],
-                            out: OChan[Message]): SimpleForwarder7[in.type,
-                                                                        middle.type,
-                                                                        out.type] = ???
-
-    type SimpleForwarder8[InC <: IChan[Message], MiddleA <: Chan[Message], MiddleB <: Chan[Message], OutC <: OChan[Message]] =
-        Par3[
-            In[InC, Message, (m: Message) => Out[MiddleA, m.type] | Out[MiddleB, m.type]],
-            In[MiddleA, Message, (m: Message) => Out[OutC, m.type]],
-            In[MiddleB, Message, (m: Message) => Out[OutC, m.type]]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // Success
-    def simpleForwarder8CHK(in: IChan[Message],
-                            middleA: Chan[Message],
-                            middleB: Chan[Message],
-                            out: OChan[Message]): SimpleForwarder8[in.type,
-                                                                     middleA.type,
-                                                                     middleB.type,
-                                                                     out.type] = ???
-
-    type SimpleForwarder9[InC <: IChan[Message], MiddleA <: Chan[Message], MiddleB <: Chan[Message], OutC <: OChan[Message]] =
-        Par[
-            Branch1[Message, InC, (
-                (m: MsgA) => Out[MiddleA, m.type],
-                (m: MsgB) => Out[MiddleA, m.type]
-            )],
-            Rec[RecX,
-                Branch[Message, (MiddleA, MiddleB), (
-                    (m: MsgA) => Out[OutC, m.type] >>: Loop[RecX],
-                    (m: MsgB) => Out[OutC, m.type] >>: Loop[RecX]
-                )]
-            ]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // FIXME FAILS
-    def simpleForwarder9CHK(in: IChan[Message],
-                            middleA: Chan[Message],
-                            middleB: Chan[Message],
-                            out: OChan[Message]): SimpleForwarder9[in.type,
-                                                                   middleA.type,
-                                                                   middleB.type,
-                                                                   out.type] = ???
-
-    type SimpleForwarder10[InA <: IChan[MsgA], InB <: IChan[MsgB], OutA <: OChan[Message], OutB <: OChan[Message]] =
-        Branch[Message, (InA, InB), (
-            (m: MsgA) => Out[OutA, m.type],
-            (m: MsgB) => Out[OutB, m.type]
-        )]
-
-    @verify(property = "forwarding(inA, inB)(outA, outB)") // Success
-    def simpleForwarder10CHK(inA: IChan[MsgA],
-                             inB: IChan[MsgB],
-                             outA: OChan[Message],
-                             outB: OChan[Message]): SimpleForwarder10[inA.type,
-                                                                      inB.type,
-                                                                      outA.type,
-                                                                      outB.type] = ???
-
-    type SimpleForwarder11[InC <: IChan[Message], MiddleA <: Chan[Message], MiddleB <: Chan[Message], OutC <: OChan[Message]] =
-        Par[
-            In[InC, Message, (m: Message) => Out[MiddleA, m.type] | Out[MiddleB, m.type]],
-            Rec[RecX, Branch[Message, (MiddleA, MiddleB), Tuple1[
-                (m: Message) => Out[OutC, m.type] >>: Loop[RecX],
-            ]]]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // FIXME FAILS
-    def simpleForwarder11CHK(in: IChan[Message],
-                             middleA: Chan[Message],
-                             middleB: Chan[Message],
-                             out: OChan[Message]): SimpleForwarder11[in.type,
-                                                                     middleA.type,
-                                                                     middleB.type,
-                                                                     out.type] = ???
-
-    type SimpleForwarder12[InC <: IChan[Message], MiddleA <: Chan[Message], MiddleB <: Chan[Message], OutC <: OChan[Message]] =
-        Par3[
-            In[InC, Message, (m: Message) => Out[MiddleA, m.type] | Out[MiddleB, m.type]],
-            Rec[RecX, In[MiddleA, Message, (m: Message) => Out[OutC, m.type] >>: Loop[RecX]]],
-            Rec[RecY, In[MiddleB, Message, (m: Message) => Out[OutC, m.type] >>: Loop[RecY]]]
-        ]
-
-    @verify(property = "forwarding(in)(out)") // Successs
-    def simpleForwarder12CHK(in: IChan[Message],
-                             middleA: Chan[Message],
-                             middleB: Chan[Message],
-                             out: OChan[Message]): SimpleForwarder12[in.type,
-                                                                     middleA.type,
-                                                                     middleB.type,
-                                                                     out.type] = ???
+    @verify(property = "forwarding(in)(out)") // Expect success, but fails FIXME
+    def nondeterministicForwarderCHK(in: IChan[Message],
+                                    middleA1: Chan[Message],
+                                    middleA2: Chan[Message],
+                                    middleB1: Chan[Message],
+                                    middleB2: Chan[Message],
+                                    out: OChan[Message],
+                                    ctrl: Chan[Unit]): NondeterministicForwarder[in.type, middleA1.type, middleA2.type, middleB1.type, middleB2.type, out.type, ctrl.type] = ???
 }

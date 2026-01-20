@@ -171,6 +171,7 @@ object CCST {
       val choices: List[(In, CCST)] = (for {
         chan <- channels
         payloadType <- extractChannelPayload(chan).toList
+        // FIXME This isn't sufficient to identify intersections!
         cont <- continuations.filter(c => payloadType <:< c.argtype.orig || c.argtype.orig <:< payloadType)
         bs <- applyIn(chan, cont, obs, probes, outputs)
       } yield bs.choices.toList).flatten

@@ -7,7 +7,7 @@ import effpi.channel._
 import effpi.system._
 import scala.concurrent.duration.Duration
 import scala.reflect.{ClassTag, TypeTest}
-import scala.util.{Failure, Success, Try}
+import scala.util.{Failure, Success, Try, NotGiven}
 
 // WARNING: double-check variance
 sealed abstract class Process {
@@ -69,6 +69,74 @@ case class >>:[P1 <: Process, P2 <: Process](p1: () => P1, p2: () => P2) extends
 type ArgumentOf[F] = F match
   case Function1[i, ?] => i
 
+// Type A is not a subtype of B (proven by absence of A <:< B evidence)
+trait NotSubtype[A, B]
+object NotSubtype {
+  given [A, B](using NotGiven[A <:< B]): NotSubtype[A, B] with {}
+}
+
+// Two types have no subtype relationship in either direction
+trait DistinctTypes[A, B]
+object DistinctTypes {
+  given [A, B](using NotSubtype[A, B], NotSubtype[B, A]): DistinctTypes[A, B] with {}
+}
+
+// Type H is distinct from all types in tuple T
+trait DistinctFromAll[H, T <: Tuple]
+object DistinctFromAll {
+  given [H]: DistinctFromAll[H, EmptyTuple] with {}
+
+  given [H, TH, TT <: Tuple](using
+    DistinctTypes[H, TH],
+    DistinctFromAll[H, TT]
+  ): DistinctFromAll[H, TH *: TT] with {}
+}
+
+// All types in a tuple are pairwise distinct (no subtype relationships)
+trait AllDistinct[T <: Tuple]
+object AllDistinct {
+  given AllDistinct[EmptyTuple] with {}
+
+  given [H, T <: Tuple](using
+    DistinctFromAll[H, T],
+    AllDistinct[T]
+  ): AllDistinct[H *: T] with {}
+}
+
+
+
+// trait NoIntersection[A, B]
+// object NoIntersection {
+//   given [A, B, C](using
+//     C <:< A,
+//     C <:< B,
+//     C =!= Nothing
+//   ): NoIntersection[A, B] with {}
+// }
+
+// trait NoOverlapAll[H, T <: Tuple]
+// object NoOverlapAll {
+//   given NoOverlapAll[H, EmptyTuple] with {}
+
+//   given [H, TH, TT <: Tuple](using
+//     NoIntersection[H, TH],
+//     NoOverlapAll[H, TT]
+//   ): NoOverlapAll[H, TH *: TT] with {}
+// }
+
+// trait NoOverlap[T <: Tuple]
+// object NoOverlap {
+//   given NoOverlap[EmptyTuple] with {}
+
+//   given [H, T <: Tuple](using
+//     NoOverlapAll[H, T],
+//     NoOverlap[T]
+//   ): AllDistinct[H *: T] with {}
+// }
+
+
+
+
 // Wrapper that stores a continuation function along with runtime type information
 case class MatchCase[A, B, P <: Process](cont: B => P, typeTest: TypeTest[A, B]) {
   // Try to match a value of type A against type B, and apply continuation if successful
@@ -104,15 +172,8 @@ object ValidBranch {
     // The match cases cover exactly all possible inputs of A
     ev3: Tuple.Union[Tuple.Map[Matches, ArgumentOf]] =:= A,
 
-    // NB: =:= is slightly different to <:< and >:> together.
-    // If we have problems with ordering/etc of unions, we might
-    // need to switch to using <:< and >:> instead.
-
-    // // Each case only accepts inputs belonging to A
-    // ev3: Tuple.Union[Tuple.Map[Matches, ArgumentOf]] <:< A,
-
-    // // // The match cases cover all possible inputs of A
-    // ev4: A <:< Tuple.Union[Tuple.Map[Matches, ArgumentOf]]
+    // The argument types of the match cases are all distinct
+    ev4: AllDistinct[Tuple.Map[Matches, ArgumentOf]] 
   ): ValidBranch[A, Chans, Matches] with {}
 }
 
