@@ -83,7 +83,7 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
   type Timer = Rec[RecX,
     In[timerReset.type, TimerReset, TimerReset => 
       Rec[RecY,
-        WithTimeout[
+        CatchTimeout[
           // If we receive a timer reset before timeout, we loop to RecY
           // because we still have a pending timeout.
           In[timerReset.type, TimerReset, TimerReset => Loop[RecY]],
@@ -98,7 +98,7 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
   ]
 
 //  type Timer = Rec[RecX,
-//     WithTimeout[
+//     CatchTimeout[
 //       In[timerReset.type, TimerReset, TimerReset => Loop[RecX]],
 //       Out[timeoutChan.type, TimerExpired] >>: Loop[RecX]
 //     ]
@@ -160,7 +160,7 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
         var millis = tr.min + scala.util.Random.nextInt(tr.max - tr.min)
 
         rec(RecY) {
-          withTimeout(
+          catchTimeout(
             {
               implicit val timeout = Duration(millis.toLong, "millis")
               receive(timerReset) { newTr =>
@@ -181,7 +181,7 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
   //   var x: Option[Int] = None
 
   //  rec(RecX) {
-  //   withTimeout(
+  //   catchTimeout(
   //     {
   //       implicit val timeout = if (x.isEmpty) Duration.Inf else Duration(x.get.toLong, "millis")
   //       receive(timerReset) { duration => 

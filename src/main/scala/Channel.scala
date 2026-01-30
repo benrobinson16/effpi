@@ -7,7 +7,7 @@ import java.util.concurrent.{LinkedTransferQueue => LTQueue}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.duration.Duration
-import effpi.process.{ProcVar, Process, In, EffpiTimeout}
+import effpi.process.{ProcVar, Process, In, EffpiTimeoutException}
 
 object ChannelStatus {
   val unscheduled = 0
@@ -27,7 +27,7 @@ trait InChannel[+A] {
 
   /** Receive a value (waiting up to `timeout`), and return it.
   *
-  * @throws EffpiTimeout if `timeout` expires.
+  * @throws EffpiTimeoutException if `timeout` expires.
   */
   def receive()(implicit timeout: Duration): A
 
@@ -126,7 +126,7 @@ trait QueueInChannel[+A](q: LTQueue[A],
     } else {
       val ret = q.poll(timeout.length, timeout.unit)
       if (ret == null) {
-        throw EffpiTimeout(s"${this}: timeout after ${timeout}")
+        throw EffpiTimeoutException(s"${this}: timeout after ${timeout}")
       }
       ret
     }

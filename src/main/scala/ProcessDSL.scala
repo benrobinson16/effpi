@@ -24,6 +24,8 @@ sealed abstract class Process {
 }
 case class Out[C <: OutChannel[A], A](channel: C, v: A) extends Process
 
+sealed abstract class TimeoutableProcess extends Process
+
 // FIXME:
 // * If we make In contravariant on A, type inference on "cont"
 //   can push the domain to any, and therefore, we lose pattern matching
@@ -36,7 +38,7 @@ case class Out[C <: OutChannel[A], A](channel: C, v: A) extends Process
 // * If we make In covariant on A, we are wrong (and besides, we get a
 //   variance error in the definition of In)
 /** Receive a value from `channel`, and pass it to `cont`. */
-case class In[C <: InChannel[A], A, P <: A => Process](channel: C, cont: P, timeout: Duration) extends Process
+case class In[C <: InChannel[A], A, P <: A => Process](channel: C, cont: P, timeout: Duration) extends TimeoutableProcess
 
 case class Fork[P <: Process](p: () => P) extends Process
 
@@ -109,13 +111,13 @@ object ValidBranch {
   ): ValidBranch[A, Chans, Matches] with {}
 }
 
-case class WithTimeout[P <: Process, Q <: Process](p: () => P, q: () => Q) extends Process
-case class EffpiTimeout(msg: String = "Timeout!") extends java.lang.RuntimeException(msg)
+case class CatchTimeout[P <: TimeoutableProcess, Q <: Process](p: () => P, onTimeout: () => Q) extends Process
+case class EffpiTimeoutException(msg: String = "Timeout!") extends java.lang.RuntimeException(msg)
 
 case class Branch[A, Chans <: Tuple, Matches <: Tuple]
   (channels: Chans, matches: Matches, timeout: Duration)
   (using val valid: ValidBranch[A, Chans, Matches], val wrapper: WrapMatches[A, Matches])
-  extends Process {
+  extends TimeoutableProcess {
 
   // Lazily computed wrapped matches with runtime type information
   lazy val wrappedMatches: wrapper.Wrapped = wrapper.wrap(matches)
@@ -248,8 +250,8 @@ package object dsl {
   /** Use channel `c` to receive a value, then pass it to the `cont`inuation. */
   def receive[C <: InChannel[A], A, P <: A => Process](c: C)(cont: P)(implicit timeout: Duration) = In[C,A,P](c, cont, timeout)
 
-  def withTimeout[P <: Process, Q <: Process](p: => P, q: => Q) =
-    WithTimeout[P, Q](() => p, () => q)
+  def catchTimeout[P <: TimeoutableProcess, Q <: Process](p: => P, q: => Q) =
+    CatchTimeout[P, Q](() => p, () => q)
 
   def branch[A, Chans <: Tuple, Matches <: Tuple](
     channels: Chans, matches: Matches
@@ -391,7 +393,7 @@ package object dsl {
       try {
         v = Some(ic.receive()(i.timeout))
       } catch {
-        case e: EffpiTimeout => {
+        case e: EffpiTimeoutException => {
           if (timeoutContinuation.isEmpty) {
             // Only rethrow if no timeout continuation is defined
             throw e
@@ -414,8 +416,8 @@ package object dsl {
         eval(env, lp, cont)
       }
     }
-    case wt: WithTimeout[_, _] => {
-      eval(env, lp, wt.p(), timeoutContinuation=Some(Continuation(env, lp, wt.q)))
+    case wt: CatchTimeout[_, _] => {
+      eval(env, lp, wt.p(), timeoutContinuation=Some(Continuation(env, lp, wt.onTimeout)))
     }
     case b: Branch[_, _, _] => {
       val startTime = System.nanoTime()
@@ -461,7 +463,7 @@ package object dsl {
           val cont = timeoutContinuation.get
           eval(cont.env, cont.lp, cont.p())
         } else {
-          throw EffpiTimeout(
+          throw EffpiTimeoutException(
             "Branch: No message received from any channel within timeout"
           )
         }
@@ -538,10 +540,7 @@ package object dsl {
       }
     }
     case s: >>:[_,_] => {
-      // We let timeout continuations propagate through sequential composition,
-      // but only to the first component. It won't get propagated to the
-      // second component, since timeouts don't otherwise propagate.
-      eval(env, s.p2 :: lp, s.p1(), timeoutContinuation)
+      eval(env, s.p2 :: lp, s.p1())
     }
   }
 }

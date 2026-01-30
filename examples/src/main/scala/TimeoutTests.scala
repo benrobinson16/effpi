@@ -16,7 +16,7 @@ package object types {
 
     type Receiver[C <: IChan[Message], C2 <: OChan[String]] =
         Rec[RecX,
-            WithTimeout[
+            CatchTimeout[
                 Branch[Message, Tuple1[C], (
                     (m: MsgA) => Loop[RecX],
                     (m: MsgB) => Loop[RecX]
@@ -33,7 +33,7 @@ package object implementation {
     def receiver(in: IChan[Message], out: OChan[String]): Receiver[in.type, out.type] = {
       rec(RecX) {
         implicit val timeout = Duration(1, "seconds")
-        withTimeout(
+        catchTimeout(
             branch1(in, (
                 (m: MsgA) => {
                     println(s"Received MsgA with value ${m.v}")
@@ -68,7 +68,7 @@ package object implementation {
     def receiver1(in: IChan[Message], out: OChan[String]) = {
       rec(RecX) {
         implicit val timeout = Duration(1, "seconds")
-        withTimeout(
+        catchTimeout(
         receive(in) {
           case m: MsgA => {
             println(s"Received MsgA with value ${m.v}")
