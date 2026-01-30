@@ -26,27 +26,26 @@ object Logger {
  }
 }
 
-case class RequestVote(reply: OChan[VoteResponse], from: Int, t1: Int, upToDate: Boolean)
 
-case class GrantVote(t1: Int)
-case class RefuseVote(t1: Int)
+type RPC = RequestVote | AppendEntries
+case class RequestVote(reply: OChan[VoteResponse], from: Int, t: Int, upToDate: Boolean)
+case class AppendEntries(reply: OChan[AckAppendEntries], from: Int, t: Int)
 
-case class AppendEntries(reply: OChan[AckAppendEntries], from: Int, t1: Int)
-
-case class AcceptAppendEntries(t1: Int)
-case class RefuseAppendEntries(t1: Int)
-
-case class TimerExpired()
-
-type RpcMessage = RequestVote | AppendEntries
 type VoteResponse = GrantVote | RefuseVote
-type AckAppendEntries = AcceptAppendEntries | RefuseAppendEntries
+case class GrantVote(t: Int)
+case class RefuseVote(t: Int)
 
+type AckAppendEntries = AcceptAppendEntries | RefuseAppendEntries
+case class AcceptAppendEntries(t: Int)
+case class RefuseAppendEntries(t: Int)
+
+// FIXME Do we need these?
+type ElectionResult = ElectionWin | ElectionLoss | ElectionInvalid
 case class ElectionWin()
 case class ElectionLoss()
 case class ElectionInvalid()
-type ElectionResult = ElectionWin | ElectionLoss | ElectionInvalid
 
+case class TimerExpired()
 case class TimerReset(min: Int, max: Int)
 val electionTimeout = TimerReset(10_000, 15_000)
 val candidateTimeout = TimerReset(5_000, 5_001) // FIXME This should be electionTimeout, but faster for detecting win
@@ -71,7 +70,7 @@ case object RecCandidate extends RecCandidate[Unit]
 sealed abstract class RecLeader[A]() extends RecVar[A]("Leader")
 case object RecLeader extends RecLeader[Unit]
 
-class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OChan[RpcMessage]](me: Int, val inbox: Inbox, val peer1: Peer1, val peer2: Peer2) {
+class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: Int, val inbox: Inbox, val peer1: Peer1, val peer2: Peer2) {
  val timerReset = Chan.async[TimerReset]()
  val timeoutChan = Chan[TimerExpired]()
  val majority = 2
@@ -79,49 +78,58 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
  var t = 0
  var vote: Option[Int] = None
 
- type Broadcast[A <: RpcMessage] = Par[Out[peer1.type, A], Out[peer2.type, A]]
- type TimerWait = Out[timeoutChan.type, TimerExpired] | PNil
- type Timer = Rec[RecX, In[timerReset.type, TimerReset, TimerReset => Par[TimerWait, Loop[RecX]]]]
+ type Broadcast[A <: RPC] = Par[Out[peer1.type, A], Out[peer2.type, A]]
 
- // FIXME Reply channels - need to pass these in, after matching against RpcMessage and extracting
+  type Timer = Rec[RecX,
+    In[timerReset.type, TimerReset, TimerReset => 
+      Rec[RecY,
+        WithTimeout[
+          // If we receive a timer reset before timeout, we loop to RecY
+          // because we still have a pending timeout.
+          In[timerReset.type, TimerReset, TimerReset => Loop[RecY]],
+
+          // Once we timeout, we loop to RecX because we now have no
+          // pending timeout. The node must reset the timer to incur
+          // a new future timeout event.
+          Out[timeoutChan.type, TimerExpired] >>: Loop[RecX]
+        ]
+      ]
+    ]
+  ]
+
+//  type Timer = Rec[RecX,
+//     WithTimeout[
+//       In[timerReset.type, TimerReset, TimerReset => Loop[RecX]],
+//       Out[timeoutChan.type, TimerExpired] >>: Loop[RecX]
+//     ]
+//   ]
+
+ // FIXME Reply channels - need to pass these in, after matching against RPC and extracting
  type GrantVoteBehaviour = (Out[OChan[VoteResponse], GrantVote] >>: Out[timerReset.type, TimerReset]) >>: Loop[RecFollower]
  type RefuseVoteBehaviour[V[A] <: RecVar[A]] = Out[OChan[VoteResponse], RefuseVote] >>: Loop[V]
  type AcceptAppendEntriesBehaviour = (Out[OChan[AckAppendEntries], AcceptAppendEntries] >>: Out[timerReset.type, TimerReset]) >>: Loop[RecFollower]
  type RefuseAppendEntriesBehaviour[V[A] <: RecVar[A]] = Out[OChan[AckAppendEntries], RefuseAppendEntries] >>: Loop[V]
 
  type Follower = Rec[RecFollower,
-   Branch[RpcMessage | TimerExpired, (inbox.type, timeoutChan.type), (
+   Branch[RPC | TimerExpired, (inbox.type, timeoutChan.type), (
     RequestVote => GrantVoteBehaviour | RefuseVoteBehaviour[RecFollower],
     AppendEntries => AcceptAppendEntriesBehaviour | RefuseAppendEntriesBehaviour[RecFollower],
     TimerExpired => Candidate
    )]
  ]
 
- type CountVotes = Rec[RecX,
-    Branch1[VoteResponse, IChan[VoteResponse], (
-        // FIXME Reply channels - need match over VoteResponse to extract
-        GrantVote => Loop[RecX] | (Out[OChan[ElectionResult], ElectionInvalid | ElectionWin] >>: PNil),
-        RefuseVote => Loop[RecX]
-    )]
-//    In[IChan[VoteResponse], VoteResponse, (voteResponse: VoteResponse) =>
-//      Loop[RecX]
-//          // FIXME Reply channels - need match over VoteResponse to extract
-//        | (Out[OChan[Int], Int] >>: Loop[RecX])
-//    ]
- ]
-
  type Candidate = Rec[RecElection,
    Out[timerReset.type, TimerReset]
-     >>: Par3[
+     >>: Par[
        // FIXME Constrain which reply channel is sent
        Broadcast[RequestVote],
-       CountVotes,
        Rec[RecCandidate,
-        Branch[RpcMessage | TimerExpired | ElectionResult, (inbox.type, timeoutChan.type, IChan[ElectionResult]), (
+        Branch[RPC | TimerExpired | VoteResponse, (inbox.type, timeoutChan.type, IChan[VoteResponse]), (
             RequestVote => GrantVoteBehaviour | RefuseVoteBehaviour[RecCandidate],
             AppendEntries => AcceptAppendEntriesBehaviour | RefuseAppendEntriesBehaviour[RecCandidate],
             TimerExpired => Loop[RecElection],
-            ElectionResult => Leader | (Out[timerReset.type, TimerReset] >>: Loop[RecFollower]) | Loop[RecElection]
+            GrantVote => Leader | (Out[timerReset.type, TimerReset] >>: Loop[RecFollower]) | Loop[RecCandidate],
+            RefuseVote => Loop[RecCandidate]
         )]
        ]
      ]
@@ -132,7 +140,7 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
      >>: Par[
        Broadcast[AppendEntries],
        Rec[RecLeader,
-        Branch[RpcMessage | TimerExpired, (inbox.type, timeoutChan.type), (
+        Branch[RPC | TimerExpired, (inbox.type, timeoutChan.type), (
           AppendEntries => AcceptAppendEntriesBehaviour | RefuseAppendEntriesBehaviour[RecLeader],
           RequestVote => GrantVoteBehaviour | RefuseVoteBehaviour[RecLeader],
           TimerExpired => (Out[timerReset.type, TimerReset] >>: (Loop[RecLeader] | Par[Broadcast[AppendEntries], Loop[RecLeader]]))
@@ -146,27 +154,50 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
    Follower
  ]
 
- def timer: Timer = {
-   rec(RecX) {
-     receive(timerReset) { duration =>
-       timerId += 1
-       val sleepTime = duration.min + scala.util.Random.nextInt(duration.max - duration.min)
+  def timer: Timer = {
+    rec(RecX) {
+      receive(timerReset) { tr =>
+        var millis = tr.min + scala.util.Random.nextInt(tr.max - tr.min)
 
-       def waitProcess(expectedId: Int): TimerWait = {
-         Thread.sleep(sleepTime)
-         if (timerId == expectedId) {
-           send(timeoutChan, TimerExpired())
-         } else {
-           nil
-         }
-       }
+        rec(RecY) {
+          withTimeout(
+            {
+              implicit val timeout = Duration(millis.toLong, "millis")
+              receive(timerReset) { newTr =>
+                millis = newTr.min + scala.util.Random.nextInt(newTr.max - newTr.min)
+                loop(RecY)
+              }
+            },
+            {
+              // Timer expires!
+              send(timeoutChan, TimerExpired()) >> loop(RecX)
+            }
+          )
+        }  
+      }
+    }
 
-       par(waitProcess(timerId), loop(RecX))
-     }
-   }
+
+  //   var x: Option[Int] = None
+
+  //  rec(RecX) {
+  //   withTimeout(
+  //     {
+  //       implicit val timeout = if (x.isEmpty) Duration.Inf else Duration(x.get.toLong, "millis")
+  //       receive(timerReset) { duration => 
+  //         x = Some(duration.min + scala.util.Random.nextInt(duration.max - duration.min))
+  //         loop(RecX)
+  //       }
+  //     },
+  //     {
+  //       x = None
+  //       send(timeoutChan, TimerExpired()) >> loop(RecX)
+  //     }
+  //   )
+  //  }
  }
 
- def broadcast[A <: RpcMessage](msg: A): Broadcast[A] = {
+ def broadcast[A <: RPC](msg: A): Broadcast[A] = {
    par(send(peer1, msg), send(peer2, msg))
  }
 
@@ -182,17 +213,17 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
          }
 
          def grant: GrantVoteBehaviour = {
-           t = Math.max(t, rv.t1)
+           t = Math.max(t, rv.t)
            vote = Some(rv.from)
            Logger.log(me, t, "FOLLOWER", s"Granting vote to Server ${rv.from}")
 
-           send(rv.reply, GrantVote(rv.t1))
+           send(rv.reply, GrantVote(rv.t))
              >> send(timerReset, electionTimeout)
              >> loop(RecFollower)
          }
 
-         if (rv.t1 < t) deny
-         else if (rv.t1 == t) {
+         if (rv.t < t) deny
+         else if (rv.t == t) {
            if ((vote.isEmpty || vote.contains(rv.from)) && rv.upToDate) grant
            else deny
          }
@@ -209,14 +240,14 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
          }
 
          def success: AcceptAppendEntriesBehaviour = {
-           t = Math.max(t, ae.t1)
-           send(ae.reply, AcceptAppendEntries(ae.t1))
+           t = Math.max(t, ae.t)
+           send(ae.reply, AcceptAppendEntries(ae.t))
              >> send(timerReset, electionTimeout)
              >> loop(RecFollower)
          }
 
-         if (ae.t1 < t) failed
-         else if (ae.t1 == t) success
+         if (ae.t < t) failed
+         else if (ae.t == t) success
          else { vote = None; success }
        },
 
@@ -228,49 +259,38 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
    }
  }
 
- def countVotes(voteResponseChan: IChan[VoteResponse], electionResultChan: OChan[ElectionResult]): CountVotes = {
-   var votesRemaining = majority - 1
+//  def countVotes(voteResponseChan: IChan[VoteResponse], electionResultChan: OChan[ElectionResult]): CountVotes = {
+//    var votesRemaining = majority - 1
 
-   rec(RecX) {
-        branch1(voteResponseChan, (
-            (gv: GrantVote) => {
-                if (gv.t1 == t) {
-                  votesRemaining -= 1
-                } else if (gv.t1 > t) {
-                    send(electionResultChan, ElectionInvalid()) >> nil
-                }
-                
-                if (votesRemaining == 0) {
-                    send(electionResultChan, ElectionWin()) >> nil
-                }
-
-                loop(RecX)
-            },
-            (rv: RefuseVote) => loop(RecX) // FIXME Check for election loss
-        ))
-   }
- }
+//    rec(RecX) {
+//         branch1(voteResponseChan, (
+            
+//         ))
+//    }
+//  }
 
  def candidate: Candidate = {
    rec(RecElection) {
      t += 1
      val voteResponseChan = Chan.async[VoteResponse]()
-     val electionResultChan = Chan.async[ElectionResult]()
+     var votesRemaining = majority - 1
+    //  val electionResultChan = Chan.async[ElectionResult]()
 
      send(timerReset, candidateTimeout)
        >> par(
          broadcast(RequestVote(voteResponseChan, me, t, true)),
-         countVotes(voteResponseChan, electionResultChan),
+        //  countVotes(voteResponseChan, electionResultChan),
          rec(RecCandidate) {
-            branch((inbox, timeoutChan, electionResultChan), (
-                (rv: RequestVote) => {
-                    if (rv.t1 > t) {
-                     Logger.log(me, t, "CANDIDATE", s"Received RequestVote from Server ${rv.from} (term=${rv.t1} > $t) - reverting to FOLLOWER")
 
-                     t = rv.t1
+            branch((inbox, timeoutChan, voteResponseChan), (
+                (rv: RequestVote) => {
+                    if (rv.t > t) {
+                     Logger.log(me, t, "CANDIDATE", s"Received RequestVote from Server ${rv.from} (term=${rv.t} > $t) - reverting to FOLLOWER")
+
+                     t = rv.t
                      vote = Some(rv.from)
 
-                     send(rv.reply, GrantVote(rv.t1))
+                     send(rv.reply, GrantVote(rv.t))
                      >> send(timerReset, electionTimeout)
                      >> loop(RecFollower)
                     } else {
@@ -279,11 +299,11 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
                     }
                 },
                 (ae: AppendEntries) => {
-                    if (ae.t1 >= t) {
-                      t = ae.t1
+                    if (ae.t >= t) {
+                      t = ae.t
                       vote = None
         
-                      send(ae.reply, AcceptAppendEntries(ae.t1))
+                      send(ae.reply, AcceptAppendEntries(ae.t))
                       >> send(timerReset, electionTimeout)
                       >> loop (RecFollower)
                     } else {
@@ -295,25 +315,44 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
                     Logger.log(me, t, "CANDIDATE", s"Election timeout - starting new election")
                     loop(RecElection)
                 },
-                (er: ElectionResult) => {
-                    er match {
-                        case ElectionWin() => {
-                            Logger.log(me, t, "CANDIDATE", s"Election win! Becoming LEADER")
-                            leader
-                        }
-                        case ElectionInvalid() => {
-                            Logger.log(me, t, "CANDIDATE", s"Election invalidated, reverting to FOLLOWER")
-
-                            // FIXME Set term
-                            send(timerReset, electionTimeout)
-                                >> loop(RecFollower)
-                        }
-                        case ElectionLoss() => {
-                            Logger.log(me, t, "CANDIDATE", s"Election lost - starting new election")
-                            loop(RecElection)
-                        }
+                (gv: GrantVote) => {
+                  if (gv.t == t) {
+                    votesRemaining -= 1
+                    
+                    if (votesRemaining == 0) {
+                      Logger.log(me, t, "CANDIDATE", s"Election win! Becoming LEADER")
+                      leader
+                    } else {
+                      loop(RecCandidate)
                     }
-                }
+                  } else if (gv.t > t) {
+                    send(timerReset, electionTimeout)
+                      >> loop(RecFollower)
+                  } else {
+                    // Ignore votes for earlier terms
+                    loop(RecCandidate)
+                  }
+                },
+                (rv: RefuseVote) => loop(RecCandidate)
+                // (er: ElectionResult) => {
+                //     er match {
+                //         case ElectionWin() => {
+                //             Logger.log(me, t, "CANDIDATE", s"Election win! Becoming LEADER")
+                //             leader
+                //         }
+                //         case ElectionInvalid() => {
+                //             Logger.log(me, t, "CANDIDATE", s"Election invalidated, reverting to FOLLOWER")
+
+                //             // FIXME Set term
+                //             send(timerReset, electionTimeout)
+                //                 >> loop(RecFollower)
+                //         }
+                //         case ElectionLoss() => {
+                //             Logger.log(me, t, "CANDIDATE", s"Election lost - starting new election")
+                //             loop(RecElection)
+                //         }
+                //     }
+                // }
             ))
          }
        )
@@ -330,13 +369,13 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
        rec(RecLeader) {
         branch((inbox, timeoutChan), (
             (ae: AppendEntries) => {
-                if (ae.t1 >= t) {
-                Logger.log(me, t, "LEADER", s"Received AppendEntries from Server ${ae.from} (term=${ae.t1}) - reverting to FOLLOWER")
+                if (ae.t >= t) {
+                Logger.log(me, t, "LEADER", s"Received AppendEntries from Server ${ae.from} (term=${ae.t}) - reverting to FOLLOWER")
     
-                t = ae.t1
+                t = ae.t
                 vote = None
     
-                send(ae.reply, AcceptAppendEntries(ae.t1))
+                send(ae.reply, AcceptAppendEntries(ae.t))
                 >> send(timerReset, electionTimeout)
                 >> loop(RecFollower)
                 } else {
@@ -345,10 +384,10 @@ class Server[Inbox <: Chan[RpcMessage], Peer1 <: OChan[RpcMessage], Peer2 <: OCh
                 }
             },
             (rv: RequestVote) => {
-                if (rv.t1 > t) {
-                Logger.log(me, t, "LEADER", s"Received RequestVote from Server ${rv.from} (term=${rv.t1} > $t) - reverting to FOLLOWER")
+                if (rv.t > t) {
+                Logger.log(me, t, "LEADER", s"Received RequestVote from Server ${rv.from} (term=${rv.t} > $t) - reverting to FOLLOWER")
     
-                t = rv.t1
+                t = rv.t
                 vote = Some(rv.from)
     
                 send(rv.reply, GrantVote(t))
@@ -391,9 +430,9 @@ object Main {
 //  @verify(property = "deadlock_free()")
  def system() = {
    // Create inbox channels for each server
-   val inbox0 = Chan.async[RpcMessage]()
-   val inbox1 = Chan.async[RpcMessage]()
-   val inbox2 = Chan.async[RpcMessage]()
+   val inbox0 = Chan.async[RPC]()
+   val inbox1 = Chan.async[RPC]()
+   val inbox2 = Chan.async[RPC]()
 
    // Create the three servers
    val server0 = new Server(0, inbox0, inbox1, inbox2)

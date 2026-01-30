@@ -3,85 +3,94 @@ package effpi.examples.branchexample
 
 import effpi.channel.{Channel => Chan, InChannel => IChan, OutChannel => OChan}
 import effpi.process._
+import effpi.process.given
 import effpi.process.dsl._
 import scala.concurrent.duration.Duration
 
 package object types {
-  type Splitter[C <: IChan[Int | String],
-                 OInt <: OChan[Int],
-                 OStr <: OChan[String]] =
-                  Rec[RecX,
-    Branch1[Int | String, C, (
-      (v: Int) => Out[OInt, v.type] >>: Loop[RecX],
-      (v: String) => Out[OStr, v.type] >>: Loop[RecX]
-    )]]
 
-  type Crossroads[C1 <: IChan[Int | String],
-                  C2 <: IChan[Int | String],
+  // Message types. Must be sealed!
+  type Message = MsgA | MsgB
+  sealed case class MsgA(v: Int)
+  sealed case class MsgB(v: String)
+
+  type Splitter[C <: IChan[Message],
+                OInt <: OChan[Int],
+                OStr <: OChan[String]] =
+    Rec[RecX,
+      Branch1[Message, C, (
+        (m: MsgA) => Out[OInt, m.v.type] >>: Loop[RecX],
+        (m: MsgB) => Out[OStr, m.v.type] >>: Loop[RecX]
+      )]
+    ]
+
+  // type T123 = Out[OChan[Int], String]
+
+  type Crossroads[C1 <: IChan[Message],
+                  C2 <: IChan[Message],
                   OInt <: OChan[Int],
                   OStr <: OChan[String]] =
     Rec[RecX,
-      Branch[Int | String, (C1, C2), (
-        (v: Int) => Out[OInt, v.type] >>: Loop[RecX],
-        (v: String) => Out[OStr, v.type] >>: Loop[RecX]
+      Branch[Message, (C1, C2), (
+        (m: MsgB) => Out[OStr, m.v.type] >>: Loop[RecX],
+        (m: MsgB) => Out[OStr, m.v.type] >>: Loop[RecX]
       )]
     ]
-  
-  case class MsgA(v: Int)
-  case class MsgB(v: Int)
-  case class MsgC(v: String)
 
-  type MyLabelledMessages = MsgA | MsgB | MsgC
+  type Producer[A, C <: OChan[A]] =
+    Rec[RecX, Out[C, A] >>: Loop[RecX]]
 
-  type CaseClasses[C <: IChan[MyLabelledMessages]] =
-    Rec[RecX,
-      Branch1[MyLabelledMessages, C, (
-        (msg: MsgA) => Loop[RecX],
-        (msg: MsgB) => Loop[RecX],
-        (msg: MsgC) => Loop[RecX]
-      )]
-    ]
+  type Consumer[A, C <: IChan[A]] =
+    Rec[RecY, In[C, A, (x: A) => Loop[RecY]]]
 }
 
 package object implementation {
   import types._
-  import effpi.process.given  // Required for TypeTest instances used by Branch runtime type matching
   implicit val timeout: Duration = Duration(30, "seconds")
 
-  def splitter(in: IChan[Int | String], outInt: OChan[Int], outStr: OChan[String]): Splitter[in.type, outInt.type, outStr.type] = {
+  def splitter(in: IChan[Message], outInt: OChan[Int], outStr: OChan[String]): Splitter[in.type, outInt.type, outStr.type] = {
     rec(RecX) {
       branch1(in, (
-        (v: Int) => send(outInt, v) >> loop(RecX),
-        (v: String) => send(outStr, v) >> loop(RecX)
+        (m: MsgA) => send(outInt, m.v) >> loop(RecX),
+        (m: MsgB) => send(outStr, m.v) >> loop(RecX)
       ))
     }
   }
 
-  def crossroads(in1: IChan[Int | String], in2: IChan[Int | String], outInt: OChan[Int], outStr: OChan[String]): Crossroads[in1.type, in2.type, outInt.type, outStr.type] = {
+  // def crossroads(in1: IChan[Message], in2: IChan[Message], outInt: OChan[Int], outStr: OChan[String]): Crossroads[in1.type, in2.type, outInt.type, outStr.type] = {
+  //   rec(RecX) {
+  //     branch((in1, in2), (
+  //       (msg: MsgA) => send(outInt, msg.v) >> loop(RecX),
+  //       (msg: MsgB) => send(outStr, msg.v) >> loop(RecX)
+  //     ))
+  //   }
+  // }
+
+  def producer(out: OChan[Message]): Producer[Message, out.type] = {
     rec(RecX) {
-      branch((in1, in2), (
-        (v: Int) => send(outInt, v) >> loop(RecX),
-        (v: String) => send(outStr, v) >> loop(RecX)
-      ))
+      if (scala.util.Random.nextBoolean()) {
+        send(out, MsgA(42)) >> loop(RecX)
+      } else {
+        send(out, MsgB("hello")) >> loop(RecX)
+      }
     }
   }
 
-  def caseClasses(in: IChan[MyLabelledMessages]): CaseClasses[in.type] = {
-    rec(RecX) {
-      branch1(in, (
-        (msg: MsgA) => {
-          println(s"  Received MsgA with v = ${msg.v}")
-          loop(RecX)
-        },
-        (msg: MsgB) => {
-          println(s"  Received MsgB with v = ${msg.v}")
-          loop(RecX)
-        },
-        (msg: MsgC) => {
-          println(s"  Received MsgC with v = ${msg.v}")
-          loop(RecX)
-        }
-      ))
+  def consumerInt(in: IChan[Int]): Consumer[Int, in.type] = {
+    rec(RecY) {
+      receive(in) { x =>
+        println(s"Consumer received Int: $x")
+        loop(RecY)
+      }
+    }
+  }
+
+  def consumerStr(in: IChan[String]): Consumer[String, in.type] = {
+    rec(RecY) {
+      receive(in) { x =>
+        println(s"Consumer received String: $x")
+        loop(RecY)
+      }
     }
   }
 }
@@ -96,13 +105,16 @@ object Main {
   def main(args: Array[String]) = {
     println("=== Basic Branch Tests ===")
 
-    val c = Chan[MyLabelledMessages]()
+    val c1 = Chan[Message]()
+    val c2 = Chan[Int]()
+    val c3 = Chan[String]()
 
     eval(
       par(
-        caseClasses(c),
-        send(c, MsgA(1)) >> send(c, MsgA(2)) >> send(c, MsgC("hello")) >> nil,
-        send(c, MsgB(3)) >> send(c, MsgC("world")) >> nil
+        producer(c1),
+        splitter(c1, c2, c3),
+        consumerInt(c2),
+        consumerStr(c3)
       )
     )
 

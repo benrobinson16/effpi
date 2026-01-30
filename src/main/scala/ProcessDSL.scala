@@ -8,6 +8,8 @@ import effpi.system._
 import scala.concurrent.duration.Duration
 import scala.reflect.{ClassTag, TypeTest}
 import scala.util.{Failure, Success, Try, NotGiven}
+import scala.deriving.Mirror
+import scala.compiletime.ops.int.*
 
 // WARNING: double-check variance
 sealed abstract class Process {
@@ -69,74 +71,6 @@ case class >>:[P1 <: Process, P2 <: Process](p1: () => P1, p2: () => P2) extends
 type ArgumentOf[F] = F match
   case Function1[i, ?] => i
 
-// Type A is not a subtype of B (proven by absence of A <:< B evidence)
-trait NotSubtype[A, B]
-object NotSubtype {
-  given [A, B](using NotGiven[A <:< B]): NotSubtype[A, B] with {}
-}
-
-// Two types have no subtype relationship in either direction
-trait DistinctTypes[A, B]
-object DistinctTypes {
-  given [A, B](using NotSubtype[A, B], NotSubtype[B, A]): DistinctTypes[A, B] with {}
-}
-
-// Type H is distinct from all types in tuple T
-trait DistinctFromAll[H, T <: Tuple]
-object DistinctFromAll {
-  given [H]: DistinctFromAll[H, EmptyTuple] with {}
-
-  given [H, TH, TT <: Tuple](using
-    DistinctTypes[H, TH],
-    DistinctFromAll[H, TT]
-  ): DistinctFromAll[H, TH *: TT] with {}
-}
-
-// All types in a tuple are pairwise distinct (no subtype relationships)
-trait AllDistinct[T <: Tuple]
-object AllDistinct {
-  given AllDistinct[EmptyTuple] with {}
-
-  given [H, T <: Tuple](using
-    DistinctFromAll[H, T],
-    AllDistinct[T]
-  ): AllDistinct[H *: T] with {}
-}
-
-
-
-// trait NoIntersection[A, B]
-// object NoIntersection {
-//   given [A, B, C](using
-//     C <:< A,
-//     C <:< B,
-//     C =!= Nothing
-//   ): NoIntersection[A, B] with {}
-// }
-
-// trait NoOverlapAll[H, T <: Tuple]
-// object NoOverlapAll {
-//   given NoOverlapAll[H, EmptyTuple] with {}
-
-//   given [H, TH, TT <: Tuple](using
-//     NoIntersection[H, TH],
-//     NoOverlapAll[H, TT]
-//   ): NoOverlapAll[H, TH *: TT] with {}
-// }
-
-// trait NoOverlap[T <: Tuple]
-// object NoOverlap {
-//   given NoOverlap[EmptyTuple] with {}
-
-//   given [H, T <: Tuple](using
-//     NoOverlapAll[H, T],
-//     NoOverlap[T]
-//   ): AllDistinct[H *: T] with {}
-// }
-
-
-
-
 // Wrapper that stores a continuation function along with runtime type information
 case class MatchCase[A, B, P <: Process](cont: B => P, typeTest: TypeTest[A, B]) {
   // Try to match a value of type A against type B, and apply continuation if successful
@@ -171,11 +105,12 @@ object ValidBranch {
 
     // The match cases cover exactly all possible inputs of A
     ev3: Tuple.Union[Tuple.Map[Matches, ArgumentOf]] =:= A,
-
-    // The argument types of the match cases are all distinct
-    ev4: AllDistinct[Tuple.Map[Matches, ArgumentOf]] 
+    
   ): ValidBranch[A, Chans, Matches] with {}
 }
+
+case class WithTimeout[P <: Process, Q <: Process](p: () => P, q: () => Q) extends Process
+case class EffpiTimeout(msg: String = "Timeout!") extends java.lang.RuntimeException(msg)
 
 case class Branch[A, Chans <: Tuple, Matches <: Tuple]
   (channels: Chans, matches: Matches, timeout: Duration)
@@ -313,6 +248,9 @@ package object dsl {
   /** Use channel `c` to receive a value, then pass it to the `cont`inuation. */
   def receive[C <: InChannel[A], A, P <: A => Process](c: C)(cont: P)(implicit timeout: Duration) = In[C,A,P](c, cont, timeout)
 
+  def withTimeout[P <: Process, Q <: Process](p: => P, q: => Q) =
+    WithTimeout[P, Q](() => p, () => q)
+
   def branch[A, Chans <: Tuple, Matches <: Tuple](
     channels: Chans, matches: Matches
   )(using ValidBranch[A, Chans, Matches], WrapMatches[A, Matches])(implicit timeout: Duration) =
@@ -439,21 +377,45 @@ package object dsl {
 
   def eval(p: Process): Try[Unit] = Try(eval(Map(), Nil, p))
 
+  case class Continuation(env: Map[ProcVar[_], (_) => Process],
+                          lp: List[() => Process],
+                          p: () => Process)
+
   @annotation.tailrec
   def eval(env: Map[ProcVar[_], (_) => Process], lp: List[() => Process],
-           p: Process): Unit = p match {
+           p: Process, timeoutContinuation: Option[Continuation] = None): Unit = p match {
     case i: In[_,_,_] => {
       val ic = i.channel
-      val v: Any = ic.receive()(i.timeout)
-      val cont = if (ic.synchronous) {
-        // We received a tuple containing a value and an ack channel
-        val (v2, ack) = v.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
-        ack.send(())
-        i.cont.asInstanceOf[Any => Process](v2)
-      } else {
-        i.cont.asInstanceOf[Any => Process](v)
+
+      var v: Option[Any] = None
+      try {
+        v = Some(ic.receive()(i.timeout))
+      } catch {
+        case e: EffpiTimeout => {
+          if (timeoutContinuation.isEmpty) {
+            // Only rethrow if no timeout continuation is defined
+            throw e
+          }
+        }
       }
-      eval(env, lp, cont)
+
+      if (v == None && timeoutContinuation.isDefined) {
+        val cont = timeoutContinuation.get
+        eval(cont.env, cont.lp, cont.p())
+      } else {
+        val cont = if (ic.synchronous) {
+          // We received a tuple containing a value and an ack channel
+          val (v2, ack) = v.get.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
+          ack.send(())
+          i.cont.asInstanceOf[Any => Process](v2)
+        } else {
+          i.cont.asInstanceOf[Any => Process](v.get)
+        }
+        eval(env, lp, cont)
+      }
+    }
+    case wt: WithTimeout[_, _] => {
+      eval(env, lp, wt.p(), timeoutContinuation=Some(Continuation(env, lp, wt.q)))
     }
     case b: Branch[_, _, _] => {
       val startTime = System.nanoTime()
@@ -461,55 +423,67 @@ package object dsl {
 
       // Keep polling all channels until we get a message or timeout
       @annotation.tailrec
-      def pollUntilTimeout(): (Any, Boolean) = {
+      def pollUntilTimeout(): Option[(Any, Boolean)] = {
         val elapsed = System.nanoTime() - startTime
+
         if (elapsed >= timeoutNanos) {
-          throw new java.util.concurrent.TimeoutException(
+          None
+        } else {
+          // Shuffle the channels
+          var shuffledChannels = scala.util.Random.shuffle(b.channels.toList)
+          var result: Option[(Any, Boolean)] = None
+
+          while (!shuffledChannels.isEmpty && result == None) {
+            val channel = shuffledChannels.head
+            shuffledChannels = shuffledChannels.tail
+
+            val ic = channel.asInstanceOf[InChannel[Any]]
+            ic.poll() match {
+              case Some(res) => result = Some((res, ic.synchronous))
+              case None => ()
+            }
+          }
+
+          result match {
+            case Some(res) => Some(res)
+            case None =>
+              // No message yet, yield and retry
+              Thread.`yield`()
+              pollUntilTimeout()
+          }
+        }
+      }
+
+      val pollResult = pollUntilTimeout()
+
+      if (pollResult.isEmpty) {
+        if (timeoutContinuation.isDefined) {
+          val cont = timeoutContinuation.get
+          eval(cont.env, cont.lp, cont.p())
+        } else {
+          throw EffpiTimeout(
             "Branch: No message received from any channel within timeout"
           )
         }
-
-        // Shuffle the channels
-        var shuffledChannels = scala.util.Random.shuffle(b.channels.toList)
-        var result: Option[(Any, Boolean)] = None
-
-        while (!shuffledChannels.isEmpty && result == None) {
-          val channel = shuffledChannels.head
-          shuffledChannels = shuffledChannels.tail
-
-          val ic = channel.asInstanceOf[InChannel[Any]]
-          ic.poll() match {
-            case Some(res) => result = Some((res, ic.synchronous))
-            case None => ()
-          }
-        }
-
-        result match {
-          case Some(res) => res
-          case None =>
-            // No message yet, yield and retry
-            Thread.`yield`()
-            pollUntilTimeout()
-        }
-      }
-
-      val (rawValue, isSynchronous) = pollUntilTimeout()
-
-      // Handle synchronous channels
-      val actualValue = if (isSynchronous) {
-        val (v2, ack) = rawValue.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
-        ack.send(())
-        v2
       } else {
-        rawValue
-      }
+        val (rawValue, isSynchronous) = pollResult.get
 
-      // Find the matching continuation based on the value's type
-      // Cast to the existential type A from Branch[A, _, _]
-      b.asInstanceOf[Branch[Any, _, _]].findMatch(actualValue) match {
-        case Some(cont) => eval(env, lp, cont)
-        case None =>
-          throw new RuntimeException(s"Branch: No matching case for received value: $actualValue")
+        // Handle synchronous channels
+        val actualValue = if (isSynchronous) {
+          val (v2, ack) = rawValue.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
+          ack.send(())
+          v2
+        } else {
+          rawValue
+        }
+
+        // Find the matching continuation based on the value's type
+        // Cast to the existential type A from Branch[A, _, _]
+        b.asInstanceOf[Branch[Any, _, _]].findMatch(actualValue) match {
+          case Some(cont) => eval(env, lp, cont)
+          case None =>
+            throw new RuntimeException(s"Branch: No matching case for received value: $actualValue")
+        }
       }
     }
     case o: Out[_,_] => {
@@ -564,7 +538,10 @@ package object dsl {
       }
     }
     case s: >>:[_,_] => {
-      eval(env, s.p2 :: lp, s.p1())
+      // We let timeout continuations propagate through sequential composition,
+      // but only to the first component. It won't get propagated to the
+      // second component, since timeouts don't otherwise propagate.
+      eval(env, s.p2 :: lp, s.p1(), timeoutContinuation)
     }
   }
 }

@@ -17,7 +17,7 @@ package object types {
         Rec[RecY, In[C, A, (x: A) => Loop[RecY]]]
 
     // Splitter...
-        
+    
     type Splitter[InC <: IChan[Message],
                   OutA <: OChan[MsgA],
                   OutB <: OChan[MsgB]] =
