@@ -234,7 +234,6 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
          Logger.log(me, t, "FOLLOWER", s"Received AppendEntries from Server ${ae.from}")
 
          def failed: RefuseAppendEntriesBehaviour[RecFollower] = {
-           println("AppendEntries failed")
            send(ae.reply, RefuseAppendEntries(t))
              >> loop(RecFollower)
          }
@@ -444,6 +443,10 @@ object Main {
  }
 
  def main(args: Array[String]): Unit = {
-   eval(system())
+    // eval(system())
+    implicit val ps = effpi.system.ProcessSystemRunnerImproved()
+    system().spawn(ps)
+    Thread.sleep(60000); ps.kill()
+    println("*** ProcessSystem killed after 60 seconds.")
  }
 }

@@ -7,7 +7,8 @@ import java.util.concurrent.{LinkedTransferQueue => LTQueue}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.duration.Duration
-import effpi.process.{ProcVar, Process, In, EffpiTimeoutException}
+import effpi.process.{ProcVar, Process, TimeoutableProcess, In, Branch, EffpiTimeoutException}
+import effpi.waiting.WaitingProcess
 
 object ChannelStatus {
   val unscheduled = 0
@@ -35,8 +36,9 @@ trait InChannel[+A] {
   def poll(): Option[A]
 
   protected[effpi] val schedulingStatus: AtomicInteger = new AtomicInteger(ChannelStatus.unscheduled)
-  protected[effpi] def enqueue(i: (Map[ProcVar[_], (_) => Process], List[() => Process], In[InChannel[Any], Any, Any => Process])): Unit
-  protected[effpi] def dequeue(): Option[(Map[ProcVar[_], (_) => Process], List[() => Process], In[InChannel[Any], Any, Any => Process])]
+  protected[effpi] def enqueue(i: WaitingProcess): Unit
+  protected[effpi] def dequeue(): Option[WaitingProcess]
+  protected[effpi] def removeWaitingProcById(id: Long): Unit
   protected[effpi] def waiting: Boolean
 
   override def toString(): String = name match {
@@ -86,8 +88,9 @@ abstract class Channel[A] extends InChannel[A] with OutChannel[A] {
   // Methods declared in InChannel
   override def receive()(implicit timeout: Duration) = in.receive()(timeout)
   override def dequeue() = in.dequeue()
+  override def removeWaitingProcById(id: Long) = in.removeWaitingProcById(id)
   override def waiting = in.waiting
-  override def enqueue(i: (Map[ProcVar[_], (_) => Process], List[() => Process], In[InChannel[Any], Any, Any => Process])) = in.enqueue(i)
+  override def enqueue(i: WaitingProcess) = in.enqueue(i)
   override def poll() = in.poll()
 
   // Methods declared in OutChannel
@@ -118,7 +121,7 @@ object Channel {
 trait QueueInChannel[+A](q: LTQueue[A],
                          override val name: Option[String] = None) extends InChannel[A] {
 
-  private val pendingInProcesses = new LTQueue[(Map[ProcVar[_], (_) => Process], List[() => Process], In[InChannel[Any], Any, Any => Process])]()
+  private val pendingInProcesses = new LTQueue[WaitingProcess]()
 
   override def receive()(implicit timeout: Duration) = {
     if (!timeout.isFinite) {
@@ -137,11 +140,21 @@ trait QueueInChannel[+A](q: LTQueue[A],
     case head => Some(head)
   }
 
-  override def enqueue(i: (Map[ProcVar[_], (_) => Process], List[() => Process], In[InChannel[Any], Any, Any => Process])): Unit = pendingInProcesses.add(i)
+  override def enqueue(i: WaitingProcess): Unit = pendingInProcesses.add(i)
 
   override def dequeue() = pendingInProcesses.poll() match {
     case null => None
     case head => Some(head)
+  }
+
+  override def removeWaitingProcById(id: Long) = {
+    val it = pendingInProcesses.iterator()
+    while (it.hasNext) {
+      val wp = it.next()
+      if (wp.id == id) {
+        it.remove()
+      }
+    }
   }
 
   override def waiting: Boolean = !pendingInProcesses.isEmpty

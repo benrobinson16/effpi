@@ -10,6 +10,7 @@ import scala.concurrent.{Future, Promise, Await}
 import effpi.channel.{Channel, InChannel, OutChannel, QueueChannel}
 import effpi.process.{ProcVar, Process, In}
 import effpi.system._
+import effpi.waiting._
 import scala.concurrent.duration.Duration
 
 abstract class Mailbox[+A] extends InChannel[A]
@@ -23,11 +24,11 @@ private class MailboxImpl[A](c: InChannel[A]) extends Mailbox[A] {
 
   override def poll() = c.poll()
 
-  override def enqueue(i: (Map[ProcVar[_], (_) => Process],
-                           List[() => Process],
-                           In[InChannel[Any], Any, Any => Process])) = c.enqueue(i)
+  override def enqueue(i: WaitingProcess) = c.enqueue(i)
 
   override def dequeue() = c.dequeue()
+
+  override def removeWaitingProcById(id: Long) = c.removeWaitingProcById(id)
 
   override def waiting = c.waiting
 }

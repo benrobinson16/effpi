@@ -9,6 +9,7 @@ import scala.util.{Failure, Success, Try}
 import scala.concurrent.duration.Duration
 
 import effpi.channel.{InChannel, OutChannel, ChannelStatus}
+import effpi.waiting._
 
 protected[system] class InputExecutor(ps: ProcessSystem, stepsLeft: Int = 10) extends Runnable {
 
@@ -26,8 +27,9 @@ protected[system] class InputExecutor(ps: ProcessSystem, stepsLeft: Int = 10) ex
               in.schedulingStatus.set(ChannelStatus.running)
           }
           in.dequeue() match {
-            case Some(proc) =>
-              multiInEval(proc, stepsLeft)
+            case Some(waitingProc) =>
+              handleDequeueOp(in, waitingProc)
+
             case None =>
               ps match {
                 case _: ProcessSystemRunnerImproved =>
@@ -42,6 +44,88 @@ protected[system] class InputExecutor(ps: ProcessSystem, stepsLeft: Int = 10) ex
     }
   }
 
+  private def handleDequeueOp(
+    in: InChannel[Any],
+    wp: WaitingProcess
+  ): Unit = {
+    wp.state match {
+      case WaitingState.Resolved =>
+        // This op has already been handled, so we do not re-enqueue it.
+        // We should reschedule the channel to handle other ops
+        // that might be waiting (as there might be a value available).
+        ps match {
+          case _: ProcessSystemRunnerImproved => ps.scheduleInCh(in)
+          case _: ProcessSystemStateMachineMultiStep => ps.smartEnqueue(in)
+        }
+
+      case WaitingState.Claiming =>
+        // Another thread is fulfilling the op.
+        // Re-enqueue because that other thread could fail to receive a value.
+        in.enqueue(wp)
+
+        // We need to reschedule! We need to ensure this channel's input
+        // gets run again when we can actually claim this op, as there might
+        // be a value available to be received.
+        ps match {
+          case _: ProcessSystemRunnerImproved => ps.scheduleInCh(in)
+          case _: ProcessSystemStateMachineMultiStep => ps.smartEnqueue(in)
+        }
+
+      case WaitingState.Pending =>
+        if (wp.tryClaim()) {
+          // We have claimed the op, try to receive
+          if (wp.deadlineExpired) {
+            wp.markResolved()
+            ps.cancelTimeout(wp.id)
+            wp.channels.foreach(_.removeWaitingProcById(wp.id))
+            wp.onTimeout match {
+              case Some(c) => multiInEval((wp.env, wp.lp, c()), stepsLeft - 1)
+              case None => throw RuntimeException("Deadline expired but no onTimeout continuation provided.")
+            }
+          } else {
+            // Deadline not yet passed
+            in.poll() match {
+              case Some(v) =>
+                // Got a value!
+                wp.markResolved()
+                ps.cancelTimeout(wp.id)
+                wp.channels.filter(_ ne in).foreach(_.removeWaitingProcById(wp.id))
+                val cont = wp.continuation(in, v, ps)
+                multiInEval((wp.env, wp.lp, cont), stepsLeft - 1)
+
+                // FIXME Explain this
+                ps match {
+                  case _: ProcessSystemRunnerImproved => ()
+                  case _: ProcessSystemStateMachineMultiStep => ps.forceSchedule(in)
+                }
+
+              case None =>
+                // No value available, revert to Pending and re-enqueue
+                wp.markPending()
+                in.enqueue(wp)
+
+                // Don't reschedule as we have checked there is no value
+                // available. The next sending operation will reschedule us.
+                ps match {
+                  case _: ProcessSystemRunnerImproved => ()
+                  case _: ProcessSystemStateMachineMultiStep => ps.smartUnschedule(in)
+                }
+            }
+          }
+        } else {
+          // Lost to another thread, re-enqueue.
+          in.enqueue(wp)
+
+          // We should reschedule because there might be a value available
+          // on the channel (we haven't been able to check).
+          ps match {
+            case _: ProcessSystemRunnerImproved => ps.scheduleInCh(in)
+            case _: ProcessSystemStateMachineMultiStep => ps.smartEnqueue(in)
+          }
+        }
+    }
+  }
+
   @annotation.tailrec
   private def multiInEval(
     proc: (Map[ProcVar[_], (_) => Process], List[() => Process], Process),
@@ -53,42 +137,34 @@ protected[system] class InputExecutor(ps: ProcessSystem, stepsLeft: Int = 10) ex
       val (env, lp, p) = proc
       p match {
         case i: In[_,_,_] => {
-          val ic = i.channel
-          ic.poll() match {
-            case Some(v) => {
-              val cont = if (ic.synchronous) {
-                // We received a tuple containing a value and an ack channel
-                val (v2, ack) = v.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
-                ack.send(())
-                // The ack recipient may need to be woken up
-                val ackIn = ack.dualIn
-                ps match {
-                  case _: ProcessSystemRunnerImproved => ps.scheduleInCh(ackIn)
-                  case _: ProcessSystemStateMachineMultiStep => ps.smartEnqueue(ackIn)
-                }
-                i.cont.asInstanceOf[Any => Process](v2)
-              } else {
-                i.cont.asInstanceOf[Any => Process](v)
-              }
-              ps match {
-                case _: ProcessSystemRunnerImproved =>
-                  ()
-                case _: ProcessSystemStateMachineMultiStep =>
-                  ps.forceSchedule(ic)
-              }
-              multiInEval((env, lp, cont), stepsLeft - 1)
-            }
-            case None => {
-              ic.enqueue((env, lp, i.asInstanceOf[In[InChannel[Any], Any, Any => Process]]))
-
-              ps match {
-                case _: ProcessSystemRunnerImproved =>
-                  ()
-                case _: ProcessSystemStateMachineMultiStep =>
-                  ps.smartUnschedule(ic)
-              }
-            }
+          // Handle in a helper function...
+          handleReadingOp(
+            WaitingProcess(env, lp, i, deadline=None, onTimeout=None),
+            stepsLeft
+          )
+        }
+        case b: Branch[_,_,_] => {
+          // Handle in a helper function...
+          handleReadingOp(
+            WaitingProcess(env, lp, b, deadline=None, onTimeout=None),
+            stepsLeft
+          )
+        }
+        case ct: CatchTimeout[_, _] => {
+          // Extract the timeout from the inner process
+          val inner = ct.p()
+          val timeout = inner match {
+            case i: In[_, _, _] => i.timeout
+            case b: Branch[_, _, _] => b.timeout
           }
+
+          val deadline = if (timeout.isFinite) Some(System.nanoTime() + timeout.toNanos) else None
+          val onTimeout = if (timeout.isFinite) Some(ct.onTimeout) else None
+
+          handleReadingOp(
+            WaitingProcess(env, lp, inner, deadline, onTimeout),
+            stepsLeft
+          )
         }
         case o: Out[_,_] => {
           val outCh = o.channel.asInstanceOf[OutChannel[Any]]
@@ -166,4 +242,29 @@ protected[system] class InputExecutor(ps: ProcessSystem, stepsLeft: Int = 10) ex
     }
   }
 
+  private def handleReadingOp(
+    wp: WaitingProcess,
+    stepsLeft: Int
+  ): Unit = {
+    wp.poll() match {
+      case Some((ch, v)) =>
+        // We have a value! Get the continuation for this value
+        // and evaluate it.
+        val cont = wp.continuation(ch, v, ps)
+        ps match {
+          case _: ProcessSystemRunnerImproved => ()
+          case _: ProcessSystemStateMachineMultiStep => ps.forceSchedule(ch)
+        }
+        multiInEval((wp.env, wp.lp, cont), stepsLeft - 1)
+
+      case None =>
+        // No value available, enqueue
+        wp.channels.foreach(_.enqueue(wp))
+        wp.scheduleTimerIfNeeded(ps)
+        ps match {
+          case _: ProcessSystemRunnerImproved => ()
+          case _: ProcessSystemStateMachineMultiStep => wp.channels.foreach(ps.smartUnschedule)
+        }
+    }
+  }
 }

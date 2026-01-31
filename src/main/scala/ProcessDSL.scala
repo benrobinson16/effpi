@@ -379,13 +379,9 @@ package object dsl {
 
   def eval(p: Process): Try[Unit] = Try(eval(Map(), Nil, p))
 
-  case class Continuation(env: Map[ProcVar[_], (_) => Process],
-                          lp: List[() => Process],
-                          p: () => Process)
-
   @annotation.tailrec
   def eval(env: Map[ProcVar[_], (_) => Process], lp: List[() => Process],
-           p: Process, timeoutContinuation: Option[Continuation] = None): Unit = p match {
+           p: Process, timeoutContinuation: Option[() => Process] = None): Unit = p match {
     case i: In[_,_,_] => {
       val ic = i.channel
 
@@ -403,7 +399,7 @@ package object dsl {
 
       if (v == None && timeoutContinuation.isDefined) {
         val cont = timeoutContinuation.get
-        eval(cont.env, cont.lp, cont.p())
+        eval(env, lp, cont())
       } else {
         val cont = if (ic.synchronous) {
           // We received a tuple containing a value and an ack channel
@@ -417,7 +413,7 @@ package object dsl {
       }
     }
     case wt: CatchTimeout[_, _] => {
-      eval(env, lp, wt.p(), timeoutContinuation=Some(Continuation(env, lp, wt.onTimeout)))
+      eval(env, lp, wt.p(), timeoutContinuation=Some(wt.onTimeout))
     }
     case b: Branch[_, _, _] => {
       val startTime = System.nanoTime()
@@ -460,8 +456,8 @@ package object dsl {
 
       if (pollResult.isEmpty) {
         if (timeoutContinuation.isDefined) {
-          val cont = timeoutContinuation.get
-          eval(cont.env, cont.lp, cont.p())
+        val cont = timeoutContinuation.get
+        eval(env, lp, cont())
         } else {
           throw EffpiTimeoutException(
             "Branch: No message received from any channel within timeout"
