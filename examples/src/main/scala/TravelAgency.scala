@@ -12,7 +12,7 @@ package types {
 
   type TravelAgency[C1 <: IChan[Decision], C2 <: OChan[String]] =
     Branch1[Decision, C1, (
-      Accept => Out[C2, String] >>: PNil,
+      Accept => Out[C2, String],
       Reject => PNil
     )]
 
@@ -30,7 +30,7 @@ package implementation {
     branch1(c1, (
       (a: Accept) => {
         println("TravelAgency: Client accepted the offer.")
-        send(c2, "Your ticket") >> nil
+        send(c2, "Your ticket")
       },
       (r: Reject) => {
         println("TravelAgency: Client rejected the offer.")

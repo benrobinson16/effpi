@@ -23,9 +23,9 @@ object Logger {
  }
 }
 
-type RPC = RequestVote | AppendEntries
-case class RequestVote(reply: OChan[VoteResponse], from: Int, t: Int, upToDate: Boolean)
-case class AppendEntries(reply: OChan[AckAppendEntries], from: Int, t: Int)
+type RPC = RequestVote[_] | AppendEntries[_]
+case class RequestVote[T <: OChan[VoteResponse]](reply: T, from: Int, t: Int, upToDate: Boolean)
+case class AppendEntries[T <: OChan[AckAppendEntries]](reply: T, from: Int, t: Int)
 
 type VoteResponse = GrantVote | RefuseVote
 case class GrantVote(t: Int)
@@ -38,10 +38,9 @@ case class RefuseAppendEntries(t: Int)
 case class TimerExpired()
 case class TimerReset(min: Int, max: Int)
 val electionTimeout = TimerReset(10_000, 15_000)
-val candidateTimeout = TimerReset(10_000, 15_000)
 val heartbeatTimeout = TimerReset(8_000, 8_001)
 
-case class Peer(rv: IChan[RequestVote], ae: IChan[AppendEntries])
+case class Peer(rv: IChan[RequestVote[_]], ae: IChan[AppendEntries[_]])
 
 private implicit val timeout: Duration = Duration(1000, "seconds")
 
@@ -62,7 +61,7 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
   var t = 0
   var vote: Option[Int] = None
 
-  // MARK: - Protocol Types
+  // MARK: - Helper protocols
 
   type Broadcast[A <: RPC] = Par[Out[peer1.type, A], Out[peer2.type, A]]
 
@@ -83,44 +82,70 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
     ]
   ]
 
-  type GrantVoteBehaviour = (Out[OChan[VoteResponse], GrantVote] >>: Out[timerReset.type, TimerReset]) >>: Loop[RecFollower]
-  type RefuseVoteBehaviour[V[A] <: RecVar[A]] = Out[OChan[VoteResponse], RefuseVote] >>: Loop[V]
-  type AcceptAppendEntriesBehaviour = (Out[OChan[AckAppendEntries], AcceptAppendEntries] >>: Out[timerReset.type, TimerReset]) >>: Loop[RecFollower]
-  type RefuseAppendEntriesBehaviour[V[A] <: RecVar[A]] = Out[OChan[AckAppendEntries], RefuseAppendEntries] >>: Loop[V]
+  // MARK: - Response behaviours
+
+  type GrantVoteBehaviour[ReplyC <: OChan[VoteResponse]] = 
+    (Out[ReplyC, GrantVote]
+      >>: Out[timerReset.type, TimerReset])
+      >>: Loop[RecFollower]
+
+  type RefuseVoteBehaviour[ReplyC <: OChan[VoteResponse], V[A] <: RecVar[A]] =
+    Out[ReplyC, RefuseVote]
+      >>: Loop[V]
+
+  type VoteResponseBehaviour[ReplyC <: OChan[VoteResponse], V[A] <: RecVar[A]] =
+    GrantVoteBehaviour[ReplyC] | RefuseVoteBehaviour[ReplyC, V]
+
+  type AcceptAppendEntriesBehaviour[ReplyC <: OChan[AckAppendEntries]] = 
+    (Out[ReplyC, AcceptAppendEntries]
+      >>: Out[timerReset.type, TimerReset])
+      >>: Loop[RecFollower]
+
+  type RefuseAppendEntriesBehaviour[ReplyC <: OChan[AckAppendEntries], V[A] <: RecVar[A]] = 
+    Out[ReplyC, RefuseAppendEntries]
+      >>: Loop[V]
+
+  type AppendEntriesResponseBehaviour[ReplyC <: OChan[AckAppendEntries], V[A] <: RecVar[A]] =
+    AcceptAppendEntriesBehaviour[ReplyC] | RefuseAppendEntriesBehaviour[ReplyC, V]
+
+  // MARK: - State behaviours
 
   type Follower = Rec[RecFollower,
     Branch[RPC | TimerExpired, (inbox.type, timeoutChan.type), (
-      RequestVote => GrantVoteBehaviour | RefuseVoteBehaviour[RecFollower],
-      AppendEntries => AcceptAppendEntriesBehaviour | RefuseAppendEntriesBehaviour[RecFollower],
+      (rv: RequestVote[_]) => VoteResponseBehaviour[rv.reply.type, RecFollower],
+      (ae: AppendEntries[_]) => AppendEntriesResponseBehaviour[ae.reply.type, RecFollower],
       TimerExpired => Candidate
     )]
   ]
 
+  type CandidateElection[ReplyC <: Chan[VoteResponse]] =
+    Par[
+      Broadcast[RequestVote[ReplyC]],
+      Rec[RecCandidate,
+        Branch[RPC | TimerExpired | VoteResponse, (inbox.type, timeoutChan.type, ReplyC), (
+          (rv: RequestVote[_]) => VoteResponseBehaviour[rv.reply.type, RecCandidate],
+          (ae: AppendEntries[_]) => AppendEntriesResponseBehaviour[ae.reply.type, RecCandidate],
+          TimerExpired => Loop[RecElection],
+          GrantVote => Leader | (Out[timerReset.type, TimerReset] >>: Loop[RecFollower]) | Loop[RecCandidate],
+          RefuseVote => Loop[RecCandidate]
+        )]
+      ]
+    ]
+
   type Candidate = Rec[RecElection,
     Out[timerReset.type, TimerReset]
-      >>: Par[
-        Broadcast[RequestVote],
-        Rec[RecCandidate,
-         Branch[RPC | TimerExpired | VoteResponse, (inbox.type, timeoutChan.type, IChan[VoteResponse]), (
-             RequestVote => GrantVoteBehaviour | RefuseVoteBehaviour[RecCandidate],
-             AppendEntries => AcceptAppendEntriesBehaviour | RefuseAppendEntriesBehaviour[RecCandidate],
-             TimerExpired => Loop[RecElection],
-             GrantVote => Leader | (Out[timerReset.type, TimerReset] >>: Loop[RecFollower]) | Loop[RecCandidate],
-             RefuseVote => Loop[RecCandidate]
-         )]
-        ]
-      ]
+      >>: CandidateElection[Chan[VoteResponse]]
   ]
 
   type Leader =
    Out[timerReset.type, TimerReset]
      >>: Par[
-       Broadcast[AppendEntries],
+       Broadcast[AppendEntries[Chan[AckAppendEntries]]],
        Rec[RecLeader,
         Branch[RPC | TimerExpired, (inbox.type, timeoutChan.type), (
-          AppendEntries => AcceptAppendEntriesBehaviour | RefuseAppendEntriesBehaviour[RecLeader],
-          RequestVote => GrantVoteBehaviour | RefuseVoteBehaviour[RecLeader],
-          TimerExpired => (Out[timerReset.type, TimerReset] >>: (Loop[RecLeader] | Par[Broadcast[AppendEntries], Loop[RecLeader]]))
+          (ae: AppendEntries[_]) => AppendEntriesResponseBehaviour[ae.reply.type, RecLeader],
+          (rv: RequestVote[_]) => VoteResponseBehaviour[rv.reply.type, RecLeader],
+          TimerExpired => (Out[timerReset.type, TimerReset] >>: (Loop[RecLeader] | Par[Broadcast[AppendEntries[Chan[AckAppendEntries]]], Loop[RecLeader]]))
         )]
     ]
   ]
@@ -131,7 +156,11 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
     Follower
   ]
 
-  // MARK: - Protocol Implementations
+  // MARK: - Helper implementations
+
+  def broadcast[A <: RPC](msg: A): Broadcast[A] = {
+    par(send(peer1, msg), send(peer2, msg))
+  }
 
   def timer: Timer = {
     rec(RecX) {
@@ -156,22 +185,20 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
     }
   }
 
-  def broadcast[A <: RPC](msg: A): Broadcast[A] = {
-    par(send(peer1, msg), send(peer2, msg))
-  }
+  // MARK: - State implementations
 
   def follower: Follower = {
     Logger.log(me, t, "FOLLOWER", "Starting as follower")
     rec(RecFollower) {
       branch((inbox, timeoutChan), (
-        (rv: RequestVote) => {
-          def deny: RefuseVoteBehaviour[RecFollower] = {
+        (rv: RequestVote[_]) => {
+          def deny: RefuseVoteBehaviour[rv.reply.type, RecFollower] = {
             Logger.log(me, t, "FOLLOWER", s"Denying vote to Server ${rv.from}")
             send(rv.reply, RefuseVote(t))
               >> loop(RecFollower)
           }
 
-          def grant: GrantVoteBehaviour = {
+          def grant: GrantVoteBehaviour[rv.reply.type] = {
             t = Math.max(t, rv.t)
             vote = Some(rv.from)
             Logger.log(me, t, "FOLLOWER", s"Granting vote to Server ${rv.from}")
@@ -189,15 +216,15 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
           else grant
         },
 
-        (ae: AppendEntries) => {
+        (ae: AppendEntries[_]) => {
           Logger.log(me, t, "FOLLOWER", s"Received AppendEntries from Server ${ae.from}")
 
-          def failed: RefuseAppendEntriesBehaviour[RecFollower] = {
+          def failed: RefuseAppendEntriesBehaviour[ae.reply.type, RecFollower] = {
             send(ae.reply, RefuseAppendEntries(t))
               >> loop(RecFollower)
           }
 
-          def success: AcceptAppendEntriesBehaviour = {
+          def success: AcceptAppendEntriesBehaviour[ae.reply.type] = {
             t = Math.max(t, ae.t)
             send(ae.reply, AcceptAppendEntries(ae.t))
               >> send(timerReset, electionTimeout)
@@ -217,72 +244,77 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
     }
   }
 
+  def candidateElection[T <: Chan[VoteResponse]](voteResponseChan: T): CandidateElection[T] = {
+    var votesRemaining = majority - 1
+
+    par(
+      broadcast(RequestVote[T](voteResponseChan, me, t, true)),
+      rec(RecCandidate) {
+
+        branch((inbox, timeoutChan, voteResponseChan), (
+          (rv: RequestVote[_]) => {
+            if (rv.t > t) {
+              Logger.log(me, t, "CANDIDATE", s"Received RequestVote[_] from Server ${rv.from} (term=${rv.t} > $t) - reverting to FOLLOWER")
+
+              t = rv.t
+              vote = Some(rv.from)
+
+              send(rv.reply, GrantVote(rv.t))
+                >> send(timerReset, electionTimeout)
+                >> loop(RecFollower)
+            } else {
+              send(rv.reply, RefuseVote(t))
+                >> loop(RecCandidate)
+            }
+          },
+          (ae: AppendEntries[_]) => {
+            if (ae.t >= t) {
+              t = ae.t
+              vote = None
+    
+              send(ae.reply, AcceptAppendEntries(ae.t))
+                >> send(timerReset, electionTimeout)
+                >> loop (RecFollower)
+            } else {
+              send(ae.reply, RefuseAppendEntries(t))
+                >> loop (RecCandidate)
+            }
+          },
+          TimerExpired => {
+              Logger.log(me, t, "CANDIDATE", s"Election timeout - starting new election")
+              loop(RecElection)
+          },
+          (gv: GrantVote) => {
+            if (gv.t == t) {
+              votesRemaining -= 1
+              
+              if (votesRemaining == 0) {
+                Logger.log(me, t, "CANDIDATE", s"Election win! Becoming LEADER")
+                leader
+              } else {
+                loop(RecCandidate)
+              }
+            } else if (gv.t > t) {
+              send(timerReset, electionTimeout)
+                >> loop(RecFollower)
+            } else {
+              // Ignore votes for earlier terms
+              loop(RecCandidate)
+            }
+          },
+          RefuseVote => loop(RecCandidate)
+        ))
+      }
+    )
+  }
+
   def candidate: Candidate = {
     rec(RecElection) {
       t += 1
       val voteResponseChan = Chan.async[VoteResponse]()
-      var votesRemaining = majority - 1
 
-      send(timerReset, candidateTimeout)
-        >> par(
-          broadcast(RequestVote(voteResponseChan, me, t, true)),
-          rec(RecCandidate) {
-
-            branch((inbox, timeoutChan, voteResponseChan), (
-                (rv: RequestVote) => {
-                    if (rv.t > t) {
-                     Logger.log(me, t, "CANDIDATE", s"Received RequestVote from Server ${rv.from} (term=${rv.t} > $t) - reverting to FOLLOWER")
-
-                     t = rv.t
-                     vote = Some(rv.from)
-
-                     send(rv.reply, GrantVote(rv.t))
-                     >> send(timerReset, electionTimeout)
-                     >> loop(RecFollower)
-                    } else {
-                      send(rv.reply, RefuseVote(t))
-                      >> loop(RecCandidate)
-                    }
-                },
-                (ae: AppendEntries) => {
-                    if (ae.t >= t) {
-                      t = ae.t
-                      vote = None
-        
-                      send(ae.reply, AcceptAppendEntries(ae.t))
-                      >> send(timerReset, electionTimeout)
-                      >> loop (RecFollower)
-                    } else {
-                      send(ae.reply, RefuseAppendEntries(t))
-                      >> loop (RecCandidate)
-                    }
-                },
-                (_: TimerExpired) => {
-                    Logger.log(me, t, "CANDIDATE", s"Election timeout - starting new election")
-                    loop(RecElection)
-                },
-                (gv: GrantVote) => {
-                  if (gv.t == t) {
-                    votesRemaining -= 1
-                    
-                    if (votesRemaining == 0) {
-                      Logger.log(me, t, "CANDIDATE", s"Election win! Becoming LEADER")
-                      leader
-                    } else {
-                      loop(RecCandidate)
-                    }
-                  } else if (gv.t > t) {
-                    send(timerReset, electionTimeout)
-                      >> loop(RecFollower)
-                  } else {
-                    // Ignore votes for earlier terms
-                    loop(RecCandidate)
-                  }
-                },
-                (rv: RefuseVote) => loop(RecCandidate)
-            ))
-          }
-        )
+      send(timerReset, electionTimeout)
+        >> candidateElection(voteResponseChan)
     }
   }
 
@@ -295,7 +327,7 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
         broadcast(AppendEntries(appendEntriesReplyChan, me, t)),
         rec(RecLeader) {
           branch((inbox, timeoutChan), (
-            (ae: AppendEntries) => {
+            (ae: AppendEntries[_]) => {
               if (ae.t >= t) {
                 Logger.log(me, t, "LEADER", s"Received AppendEntries from Server ${ae.from} (term=${ae.t}) - reverting to FOLLOWER")
 
@@ -303,29 +335,29 @@ class Server[Inbox <: Chan[RPC], Peer1 <: OChan[RPC], Peer2 <: OChan[RPC]](me: I
                 vote = None
 
                 send(ae.reply, AcceptAppendEntries(ae.t))
-                >> send(timerReset, electionTimeout)
-                >> loop(RecFollower)
+                  >> send(timerReset, electionTimeout)
+                  >> loop(RecFollower)
               } else {
                 send(ae.reply, RefuseAppendEntries(t))
-                >> loop(RecLeader)
+                  >> loop(RecLeader)
               }
             },
-            (rv: RequestVote) => {
+            (rv: RequestVote[_]) => {
               if (rv.t > t) {
-                Logger.log(me, t, "LEADER", s"Received RequestVote from Server ${rv.from} (term=${rv.t} > $t) - reverting to FOLLOWER")
+                Logger.log(me, t, "LEADER", s"Received RequestVote[_] from Server ${rv.from} (term=${rv.t} > $t) - reverting to FOLLOWER")
     
                 t = rv.t
                 vote = Some(rv.from)
     
                 send(rv.reply, GrantVote(t))
-                >> send(timerReset, electionTimeout)
-                >> loop(RecFollower)
+                  >> send(timerReset, electionTimeout)
+                  >> loop(RecFollower)
               } else {
                 send(rv.reply, RefuseVote(t))
-                >> loop(RecLeader)
+                  >> loop(RecLeader)
               }
             },
-            (_: TimerExpired) => {
+            TimerExpired => {
                 Logger.log(me, t, "LEADER", "Heartbeat timeout - sending AppendEntries to all followers")
 
                 if (scala.util.Random.nextInt(10) >= 8) {

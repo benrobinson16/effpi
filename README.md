@@ -6,6 +6,10 @@ based on _type-level model checking_.
 
 **This is an extended version of Effpi, with support for branching and timeout operations. See the paper for details.**
 
+New examples in this extended version include: [Raft](examples/src/main/scala/Raft.scala),
+[TravelAgency](examples/src/main/scala/TravelAgency.scala) and [AuctionHouse](examples/src/main/scala/AuctionHouse.scala).
+These illustrate the majority of the new features.
+
 The home page of (the original) Effpi is: <https://alcestes.github.io/effpi>
 
 **Note**: to compile Effpi, JDK 11 is recommended.
