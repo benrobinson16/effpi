@@ -25,11 +25,26 @@ package types {
       )]
     ]
 
+  type Broadcaster[C <: IChan[Notification], C1 <: OChan[Notification], C2 <: OChan[Notification], C3 <: OChan[Notification]] =
+    Rec[RecX,
+      Branch1[Notification, C, (
+        (m: NewStartingPrice) => ((Out[C1, m.type] >>: Out[C2, m.type]) >>: Out[C3, m.type]) >>: Loop[RecX],
+        (m: AuctionEnded) => ((Out[C1, m.type] >>: Out[C2, m.type]) >>: Out[C3, m.type]) >>: PNil
+      )]
+    ]
+
   type AuctionHouse[ClientChan <: IChan[Bid], AuctioneerChan <: IChan[CloseAuction], BroadcasterChan <: OChan[Notification]] =
     Out[BroadcasterChan, NewStartingPrice] >>: Rec[RecX,
       CatchTimeout[
         Branch[Bid | CloseAuction, (ClientChan, AuctioneerChan), (
-          (m: Bid) => Loop[RecX], // FIXME Different continuation if bids exist
+          (m: Bid) => Rec[RecY,
+            // Now that we have a bid, we don't reduce the price anymore.
+            // Keep accepting bids until the auctioneer closes the auction.
+            Branch[Bid | CloseAuction, (ClientChan, AuctioneerChan), (
+              (n: Bid) => Loop[RecY],
+              (p: CloseAuction) => Out[BroadcasterChan, AuctionEnded] >>: PNil
+            )]
+          ],
           (m: CloseAuction) => Out[BroadcasterChan, AuctionEnded] >>: PNil
         )],
         // If no bids, reduce starting price
@@ -42,7 +57,7 @@ package implementation {
   import types._
   import scala.concurrent.duration.Duration
 
-  implicit val timeout: Duration = Duration(100, "seconds")
+  implicit val timeout: Duration = Duration.Inf
 
   def auctioneer(c: OChan[CloseAuction]): Auctioneer[c.type] = {
     Thread.sleep(30_000) // Auction runs for 30 seconds
@@ -74,17 +89,11 @@ package implementation {
   def broadcaster(c: IChan[Notification],
                   c1: OChan[Notification],
                   c2: OChan[Notification],
-                  c3: OChan[Notification]) = {
+                  c3: OChan[Notification]): Broadcaster[c.type, c1.type, c2.type, c3.type] = {
     rec(RecX) {
       branch1(c, (
-        (m: NewStartingPrice) => {
-          println(s"Broadcaster: New starting price is ${m.price}, broadcasting to clients.")
-          send(c1, m) >> send(c2, m) >> send(c3, m) >> loop(RecX)
-        },
-        (m: AuctionEnded) => {
-          println(s"Broadcaster: Auction ended, notifying clients.")
-          send(c1, m) >> send(c2, m) >> send(c3, m) >> nil
-        }
+        (m: NewStartingPrice) => send(c1, m) >> send(c2, m) >> send(c3, m) >> loop(RecX),
+        (m: AuctionEnded) => send(c1, m) >> send(c2, m) >> send(c3, m) >> nil
       ))
     }
   }
@@ -100,7 +109,19 @@ package implementation {
           branch((cClient, cAuctioneer), (
             (m: Bid) => {
               println(s"AuctionHouse: Received bid of ${m.amount}, waiting for more bids or auction close.")
-              loop(RecX)
+              rec(RecY) {
+                implicit val timeout: Duration = Duration.Inf
+                branch((cClient, cAuctioneer), (
+                  (n: Bid) => {
+                    println(s"AuctionHouse: Received another bid of ${n.amount}, continuing to wait.")
+                    loop(RecY)
+                  },
+                  (n: CloseAuction) => {
+                    println(s"AuctionHouse: Auction closed by auctioneer.")
+                    send(cBroadcaster, AuctionEnded()) >> nil
+                  }
+                ))
+              }
             },
             (m: CloseAuction) => {
               println(s"AuctionHouse: Auction closed by auctioneer.")

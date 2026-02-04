@@ -416,15 +416,12 @@ package object dsl {
       eval(env, lp, wt.p(), timeoutContinuation=Some(wt.onTimeout))
     }
     case b: Branch[_, _, _] => {
-      val startTime = System.nanoTime()
-      val timeoutNanos = b.timeout.toNanos
+      val deadline = if (b.timeout.isFinite) Some(System.nanoTime() + b.timeout.toNanos) else None
 
       // Keep polling all channels until we get a message or timeout
       @annotation.tailrec
       def pollUntilTimeout(): Option[(Any, Boolean)] = {
-        val elapsed = System.nanoTime() - startTime
-
-        if (elapsed >= timeoutNanos) {
+        if (deadline.isDefined && System.nanoTime() >= deadline.get) {
           None
         } else {
           // Shuffle the channels
