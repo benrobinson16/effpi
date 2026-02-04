@@ -3,12 +3,17 @@
 // Released under the MIT License: https://opensource.org/licenses/MIT
 package effpi.system
 
-import java.util.concurrent.Executors
+import java.util.concurrent.{Executors, ConcurrentHashMap}
 
 import scala.util.{Failure, Success, Try}
 import scala.concurrent.duration.Duration
+import java.util.concurrent.{Executors, ConcurrentHashMap, ScheduledExecutorService, ScheduledFuture, TimeUnit}
 
 import effpi.channel.{InChannel, OutChannel, ChannelStatus}
+
+trait TimeoutDuration
+case class AfterDelay(delayNanos: Long) extends TimeoutDuration
+case class AtTime(timeNanos: Long) extends TimeoutDuration
 
 trait ProcessSystem {
 
@@ -21,6 +26,7 @@ trait ProcessSystem {
     alive = false
     threads.foreach { t => t.interrupt() }
     threads.foreach { t => t.join() }
+    timerExecutor.shutdown()
   }
 
   val runningQueue = new SchedulingQueue[(Map[ProcVar[_], (_) => Process], List[() => Process], Process)]
@@ -68,6 +74,34 @@ trait ProcessSystem {
     }
   }
 
+  private lazy val timerExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+  private val pendingTimeouts = new ConcurrentHashMap[Long, ScheduledFuture[_]]()
+
+  def scheduleTimeout(id: Long, timeout: TimeoutDuration, callback: () => Unit): Unit = {
+    val delayNanos = timeout match {
+      case AfterDelay(d) => d
+      case AtTime(t) =>
+        val now = System.nanoTime()
+        math.max(t - now, 0)
+    }
+
+    val future = timerExecutor.schedule(
+      new Runnable { def run() = callback() },
+      delayNanos,
+      TimeUnit.NANOSECONDS
+    )
+
+    // println(s"Scheduling timeout with delay: ${delayNanos}")
+
+    pendingTimeouts.put(id, future)
+  }
+
+  def cancelTimeout(id: Long): Unit = {
+    val future = pendingTimeouts.remove(id)
+    if (future != null) {
+      future.cancel(false)
+    }
+  }
 }
 
 object ProcessSystemRunnerImproved {

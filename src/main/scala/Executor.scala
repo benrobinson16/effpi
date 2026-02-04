@@ -9,6 +9,7 @@ import scala.util.{Failure, Success, Try}
 import scala.concurrent.duration.Duration
 
 import effpi.channel.{InChannel, OutChannel}
+import effpi.waiting._
 
 protected[system] class Executor(ps: ProcessSystem, stepsLeft: Int = 10) extends Runnable {
 
@@ -37,34 +38,34 @@ protected[system] class Executor(ps: ProcessSystem, stepsLeft: Int = 10) extends
       val (env, lp, p) = proc
       p match {
       case i: In[_,_,_] => {
-        ps match {
-          case _: ProcessSystemRunnerImproved => {
-            i.channel.enqueue((env, lp, i.asInstanceOf[In[InChannel[Any], Any, Any => Process]]))
-            ()
-          }
-          case _: ProcessSystemStateMachineMultiStep => {
-            val ic = i.channel
-            ic.poll() match {
-              case Some(v) =>
-                val cont = if (ic.synchronous) {
-                  // We received a tuple containing a value and an ack channel
-                  val (v2, ack) = v.asInstanceOf[Tuple2[Any, OutChannel[Unit]]]
-                  ack.send(())
-                  // The ack recipient may need to be woken up
-                  // Remember: ps is ProcessSystemStateMachineMultiStep
-                  ps.smartEnqueue(ack.dualIn)
-                  i.cont.asInstanceOf[Any => Process](v2)
-                } else {
-                  i.cont.asInstanceOf[Any => Process](v)
-                }
-                //ps.forceSchedule(ic)
-                fastEval((env, lp, cont), stepsLeft - 1)
-              case None =>
-                ic.enqueue((env, lp, i.asInstanceOf[In[InChannel[Any], Any, Any => Process]]))
-                ps.smartEnqueue(ic)
-            }
-          }
+        // Handle in a helper function...
+        handleReadingOp(
+          WaitingProcess(env, lp, i, deadline=None, onTimeout=None),
+          stepsLeft
+        )
+      }
+      case b: Branch[_,_,_] => {
+        // Handle in a helper function...
+        handleReadingOp(
+          WaitingProcess(env, lp, b, deadline=None, onTimeout=None),
+          stepsLeft
+        )
+      }
+      case ct: CatchTimeout[_, _] => {
+        // Extract the timeout from the inner process
+        val inner = ct.p()
+        val timeout = inner match {
+          case i: In[_, _, _] => i.timeout
+          case b: Branch[_, _, _] => b.timeout
         }
+
+        val deadline = if (timeout.isFinite) Some(System.nanoTime() + timeout.toNanos) else None
+        val onTimeout = if (timeout.isFinite) Some(ct.onTimeout) else None
+
+        handleReadingOp(
+          WaitingProcess(env, lp, inner, deadline, onTimeout),
+          stepsLeft
+        )
       }
       case o: Out[_,_] => {
         val outCh = o.channel.asInstanceOf[OutChannel[Any]]
@@ -142,4 +143,29 @@ protected[system] class Executor(ps: ProcessSystem, stepsLeft: Int = 10) extends
     }
   }
 
+  private def handleReadingOp(
+    wp: WaitingProcess,
+    stepsLeft: Int
+  ): Unit = {
+    ps match {
+      case _: ProcessSystemRunnerImproved =>
+        // Enqueue and schedule timeout
+        wp.channels.foreach(_.enqueue(wp))
+        wp.scheduleTimerIfNeeded(ps)
+      
+      case _: ProcessSystemStateMachineMultiStep =>
+        wp.poll() match {
+          case Some((ch, v)) =>
+            // We got a value immediately
+            val cont = wp.continuation(ch, v, ps)
+            fastEval((wp.env, wp.lp, cont), stepsLeft - 1)
+          
+          case None =>
+            // No value available, enqueue and schedule
+            wp.channels.foreach(_.enqueue(wp))
+            wp.channels.foreach(ps.smartEnqueue)
+            wp.scheduleTimerIfNeeded(ps)
+        }
+    }
+  }
 }
