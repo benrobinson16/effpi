@@ -156,47 +156,7 @@ object CCST {
            (implicit ctx: Context): Option[CCST] = t match {
     case verif.PNil => Some(End)
     case verif.Out(chan, value) => Some(Out(chan, value, End))
-    case verif.In(chan, depfun) => applyIn(chan, depfun, obs, probes, outputs)
-    case verif.Seq(verif.Fork(b1), b2) => for {
-      p1 <- apply(b1, obs, probes, outputs)
-      p2 <- apply(b2, obs, probes, outputs)
-    } yield Par(p1, p2)
-    case verif.Seq(pre, post) => for {
-      pre2 <- apply(pre, obs, probes, outputs)
-      if (pre2.sequential && !pre2.recursive)
-      post2 <- apply(post, obs, probes, outputs)
-    } yield pre2.concat(post2)
-    case verif.Branch(channels, continuations) => {
-      import effpi.verifier.Verifier.extractChannelPayload
-      val choices: List[(In, CCST)] = (for {
-        chan <- channels
-        payloadType <- extractChannelPayload(chan).toList
-        // FIXME This isn't sufficient to identify intersections!
-        cont <- continuations.filter(c => payloadType <:< c.argtype.orig || c.argtype.orig <:< payloadType)
-        bs <- applyIn(chan, cont, obs, probes, outputs)
-      } yield bs.choices.toList).flatten
-
-      if (choices.isEmpty) {
-        report.log(s"CCST(): cannot convert to branching: Branch(${channels}, ${continuations})")
-        None
-      } else {
-        Some(Branch(Map(choices:_*)))
-      }
-    }
-    case verif.Or(b1, b2) => for {
-      p1 <- apply(b1, obs, probes, outputs)
-      p2 <- apply(b2, obs, probes, outputs)
-    } yield Or(p1, p2)
-    case verif.Fork(beh) => apply(beh, obs, probes, outputs)
-    case verif.RecDef(name, body) => for {
-      body2 <- apply(body, obs, probes, outputs)
-    } yield Rec(RecVar(name), body2)
-    case verif.RecVar(name) => Some(RecVar(name))
-  }
-
-  private def applyIn(chan: verif.ValueType, depfun: verif.DepFun, obs: Verifier.ObsEnv,
-                      probes: Verifier.VerifEnv, outputs: Set[ChanPayload])
-                      (implicit ctx: Context): Option[Branch] = {
+    case verif.In(chan, depfun) => {
       // Is the input channel being observed?
       val observed = obs.exists { o => chan.orig <:< o.orig }
       val branches: Option[List[(In, CCST)]] = optList(
@@ -230,12 +190,31 @@ object CCST {
       )
       branches match {
         case None => {
-          report.log(s"CCST(): cannot convert to branching: In(${chan}, ${depfun})")
+          report.log(s"CCST(): cannot convert to branching: ${t}")
           None
         }
         case Some(bs) => {
           Some(Branch(Map(bs:_*)))
         }
       }
+    }
+    case verif.Seq(verif.Fork(b1), b2) => for {
+      p1 <- apply(b1, obs, probes, outputs)
+      p2 <- apply(b2, obs, probes, outputs)
+    } yield Par(p1, p2)
+    case verif.Seq(pre, post) => for {
+      pre2 <- apply(pre, obs, probes, outputs)
+      if (pre2.sequential && !pre2.recursive)
+      post2 <- apply(post, obs, probes, outputs)
+    } yield pre2.concat(post2)
+    case verif.Or(b1, b2) => for {
+      p1 <- apply(b1, obs, probes, outputs)
+      p2 <- apply(b2, obs, probes, outputs)
+    } yield Or(p1, p2)
+    case verif.Fork(beh) => apply(beh, obs, probes, outputs)
+    case verif.RecDef(name, body) => for {
+      body2 <- apply(body, obs, probes, outputs)
+    } yield Rec(RecVar(name), body2)
+    case verif.RecVar(name) => Some(RecVar(name))
   }
 }

@@ -64,10 +64,6 @@ sealed abstract class BehType {
     }
     case Fork(forked) => forked.mailboxes
     case Or(opt1, opt2) => opt1.mailboxes ++ opt2.mailboxes
-    case Branch(chans, continuations) => chans.flatMap {
-      case m: Mailbox => Some(m)
-      case _ => None
-    }.toSet ++ continuations.flatMap(_.ret.mailboxes).toSet
     case Seq(pre, post) => pre.mailboxes ++ post.mailboxes
     case RecDef(_name, body) => body.mailboxes
   }
@@ -95,43 +91,18 @@ sealed abstract class BehType {
     }
     case Fork(forked) => forked.fullEnv(observed, env)
     case Or(opt1, opt2) => opt2.fullEnv(observed, opt1.fullEnv(observed, env))
-    case Branch(chans, continuations) => {
-      // FIXME IS THIS RIGHT???
-      // The code below introduces a new probe for EVERY continuation if
-      // ANY of the input channels are observed. Should this be per-channel?
-      // Should the input types of the channels be used for the SyntTypeVar
-      // rather than the continuation argtypes? Should we limit to only the
-      // continuations which are reachable from the observed channels?
-
-      val chanObserved = chans.exists {
-        case v: TypeVar if observed.contains(v) => true
-        case m: Mailbox if observed.contains(m) => true
-        case _ => false
-      }
-
-      val initialEnv = if (chanObserved) env ++ continuations.map { cont => SyntTypeVar.fresh(cont.argtype.orig) }
-                       else env          
-
-      continuations.foldLeft(initialEnv) { (accEnv, cont) =>
-        cont.ret.fullEnv(observed, accEnv)
-      }
-    }
     case Seq(pre, post) => post.fullEnv(observed, pre.fullEnv(observed, env))
     case RecDef(_name, body) => body.fullEnv(observed, env)
   }
 
   /** Substitute the given TypeVar with the given ValueType */
-  def subst(x: TypeVar, v: ValueType)(implicit ctx: Context): BehType = this match {
+  def subst(x: TypeVar, v: ValueType): BehType = this match {
     case PNil => PNil
     case In(chan, cont) => In(chan.subst(x, v), cont.subst(x, v))
     case Out(chan, value) => Out(chan.subst(x, v), value.subst(x, v))
     case Fork(forked) => Fork(forked.subst(x, v))
     case Or(opt1, opt2) => Or(opt1.subst(x, v), opt2.subst (x, v))
     case Seq(pre, post) => Seq(pre.subst(x, v), post.subst(x, v))
-    case Branch(chans, continuations) => Branch(
-      chans.map(_.subst(x, v)),
-      continuations.map(_.subst(x, v))
-    )
     case RecDef(name, body) => RecDef(name, body.subst(x, v))
     case rv: RecVar => rv
   }
@@ -142,7 +113,6 @@ case class In(chan: ValueType, cont: DepFun) extends BehType
 case class Out(chan: ValueType, value: ValueType) extends BehType
 case class Fork(forked: BehType) extends BehType
 case class Or(opt1: BehType, opt2: BehType) extends BehType
-case class Branch(chans: List[ValueType], continuations: List[DepFun]) extends BehType
 case class Seq(pre: BehType, post: BehType) extends BehType
 case class RecDef(name: String, body: BehType) extends BehType
 case class RecVar(name: String) extends BehType
@@ -163,7 +133,7 @@ sealed abstract trait ValueType(val orig: Types.Type) {
   *
   * Note that the resulting ValueType will preserve the orig field
   */
-  def subst(x: TypeVar, v: ValueType)(implicit ctx: Context): ValueType = this match {
+  def subst(x: TypeVar, v: ValueType): ValueType = this match {
     case df: DepFun => df.subst(x, v)
     case gt: GroundType => gt
     case at: AppType => at
@@ -177,7 +147,7 @@ sealed abstract trait ValueType(val orig: Types.Type) {
 }
 case class DepFun(arg: TypeVar, argtype: ValueType, ret: BehType)(override val orig: Types.Type) extends ValueType(orig) {
   /** Override method to refine return type */
-  override def subst(x: TypeVar, v: ValueType)(implicit ctx: Context): DepFun = {
+  override def subst(x: TypeVar, v: ValueType): DepFun = {
     this.copy(ret = ret.subst(x, v))(orig)
   }
 }
@@ -222,11 +192,7 @@ object Verifier {
     }
 
     def OutChannel(implicit ctx: Context) = {
-      requiredClassRef("effpi.channel.OutChannel").symbol.asClass
-    }
-
-    def Channel(implicit ctx: Context) = {
-      requiredClassRef("effpi.channel.Channel").symbol.asClass
+      requiredClassRef("effpi.channel.InChannel").symbol.asClass
     }
 
     def Behavior(implicit ctx: Context) = {
@@ -269,9 +235,6 @@ object Verifier {
     }
     def ProcVar(implicit ctx: Context) = {
       requiredClassRef("effpi.process.ProcVar").symbol.asClass
-    }
-    def Branch(implicit ctx: Context) = {
-      requiredClassRef("effpi.process.Branch").symbol.asClass
     }
   }
 
@@ -327,17 +290,6 @@ object Verifier {
     //if (ret) report.log(s"Can communicate:\n${t1.orig.show}\n${t2.orig.show}")
     //else report.log(s"Cannot communicate:\n${t1.orig.show}\n${t2.orig.show}")
     ret
-  }
-
-  // Get the payload type of a channel
-  def extractChannelPayload(chan: ValueType)(implicit ctx: Context): Option[Types.Type] = chan match {
-    case AppType(tcons, args) if tcons.typeSymbol == DSL.InChannel || tcons.typeSymbol == DSL.Channel => {
-      assert(args.length == 1)
-      Some(args(0).orig)
-    }
-    case TypeVar(_, widened) => extractChannelPayload(widened)
-    case TypeVarPrefix(_, tvar) => extractChannelPayload(tvar)
-    case _ => None
   }
 }
 
@@ -695,7 +647,7 @@ class VerifierPhase(keepTmp: Boolean,
               // We will recognise uses of mailbox(es) as In[Mailbox...]
               toBehType(args(1))
             } else {
-              report.warning(s"Unsupported implicit function application: ${r2}")
+              report.log(s"Unsupported implicit function application: ${r2}")
               None
             }
           }
@@ -733,18 +685,18 @@ class VerifierPhase(keepTmp: Boolean,
               if (args(2) == args(3)) {
                 for { body <- toBehType(args(3)) } yield RecDef(ref.show, body)
               } else {
-                report.warning(s"Def: mismatching body and continuation:\n${args(3)}\n${args(4)}")
+                report.log(s"Def: mismatching body and continuation:\n${args(3)}\n${args(4)}")
                 None
               }
             }
             case _ => {
               // For now, we only support simple recursion without parameters
-              report.warning(s"Def: unsupported recursion argument type: ${args(1)}")
+              report.log(s"Def: unsupported recursion argument type: ${args(1)}")
               None
             }
           }
           case _ => {
-            report.warning(s"Def: unsupported recursion variable: ${args(0)}")
+            report.log(s"Def: unsupported recursion variable: ${args(0)}")
             None
           }
         }
@@ -757,34 +709,17 @@ class VerifierPhase(keepTmp: Boolean,
             }
             case _ => {
               // For now, we only support simple recursion without parameters
-              report.warning(s"Call: unsupported recursion argument type: ${args(1)}")
+              report.log(s"Call: unsupported recursion argument type: ${args(1)}")
               None
             }
           }
           case _ => {
-            report.warning(s"Call: unsupported recursion variable: ${args(0)}")
+            report.log(s"Call: unsupported recursion variable: ${args(0)}")
             None
           }
         }
-      } else if (r.typeSymbol == DSL.Branch) {
-        assert(args.length == 3)
-
-        val channels = extractTuple(args(1)).map(toValueType(_))
-        val matches = extractTuple(args(2)).map(toDepFun(_))
-
-        if (channels.exists(_.isEmpty) || matches.exists(_.isEmpty)) {
-          report.warning(s"Branch: unable to convert all channel/match types")
-          None
-        } else {
-          val channelsVT = channels.map(_.get)
-          val matchesVT = matches.map(_.get)
-
-          // FIXME Do we need to do any checks here?
-          // E.g. matches cover all channel types, are distinct, etc?
-          Some(Branch(channelsVT, matchesVT))
-        }
       } else {
-        report.warning(s"App: unsupported TypeSymbol: ${r.typeSymbol}")
+        report.log(s"App: unsupported TypeSymbol: ${r.typeSymbol}")
         None
       }
     }
@@ -793,7 +728,7 @@ class VerifierPhase(keepTmp: Boolean,
     }
     case _ => None
   }) orElse {
-    report.warning(s"Cannot convert to behavioral type:\n${t}")
+    report.log(s"Cannot convert to behavioral type:\n${t}")
     None
   }
 
@@ -818,9 +753,8 @@ class VerifierPhase(keepTmp: Boolean,
     case ParamRef(r) => toTypeVar(t)
     case np: NoPrefix => Some(np)
     case tb: TypeBounds => Some(tb)
-    case ot: OrType => Some(GroundType(ot.orig))
     case _ => {
-      report.warning(s"Cannot convert to ValueType: ${t}")
+      report.log(s"Cannot convert to ValueType: ${t}")
       None
     }
   }
@@ -839,7 +773,7 @@ class VerifierPhase(keepTmp: Boolean,
     case m @ MethodType(paramNames, paramTypes, ret) => {
       assert(paramNames.length == paramTypes.length)
       if (paramNames.length != 1) {
-        report.warning(s"toDepFun: cannot convert MethodType with 2+ parameters: ${t}")
+        report.log(s"toDepFun: cannot convert MethodType with 2+ parameters: ${t}")
         None
       } else {
         for {
@@ -854,7 +788,7 @@ class VerifierPhase(keepTmp: Boolean,
     // } yield DepFun(/* TODO: create a fresh name here*/, argt, rett)
     case _ => None
   }) orElse {
-    report.warning(s"Cannot convert to ${DepFun.getClass.getName}: ${t}")
+    report.log(s"Cannot convert to ${DepFun.getClass.getName}: ${t}")
     None
   }
 
@@ -891,24 +825,6 @@ class VerifierPhase(keepTmp: Boolean,
           }
         }
       }).getOrElse(None)
-    }
-  }
-
-  // Extract a tuple type to a list of types
-  // Important to handle both TupleN[...] and *:
-  private def extractTuple(t: SimpleType)(implicit ctx: Context): List[SimpleType] = t match {
-    case App(TypeRef(r), args) if r.typeSymbol.fullName.toString.startsWith("scala.Tuple") => {
-      args.toList
-    }
-    case App(TypeRef(r), args) if (r.show == "scala.*:" || r.typeSymbol.fullName.toString == "scala.*:") && args.length == 2 => {
-      args(0) :: extractTuple(args(1))
-    }
-    case TypeRef(r) if r.show == "scala.EmptyTuple" || r.typeSymbol.fullName.toString == "scala.EmptyTuple" => {
-      Nil
-    }
-    case _ => {
-      report.log(s"extractTuple: unexpected tuple type: ${t}")
-      List(t)
     }
   }
 }
